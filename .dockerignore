@@ -3,7 +3,6 @@ __pycache__/
 .pytest_cache/
 .env
 dashboard_settings.json
-*.md
 test_*.py
 ProxyPilot/
 .git/
