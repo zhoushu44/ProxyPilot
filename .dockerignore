@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.env
+dashboard_settings.json
+*.md
+test_*.py
+ProxyPilot/
+.git/
+.gitignore

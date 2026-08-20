@@ -1,0 +1,2 @@
+alibabacloud-ecs20140526==7.9.6
+alibabacloud-bssopenapi20171214==5.1.1
