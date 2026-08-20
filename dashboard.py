@@ -85,7 +85,7 @@ HTML = r'''<!doctype html>
 </style>
 </head>
 <body><div class="app">
-<header class="toolbar"><div class="title">节点调和控制台</div><div class="sep"></div><label class="field">目标节点数 <input id="target" type="number" min="0" max="1000" aria-label="目标节点数"></label><button id="saveTarget">应用</button><button id="reconcile" class="primary">立即调和</button><button id="openProxyTest">代理测试</button><button id="openBalanced">负载均衡</button><button id="openSettings">阿里云设置</button><button id="openSecurityGroup">创建安全组</button><button id="openTemplate">创建启动模板</button><a href="/help" style="color:#356b91;text-decoration:none;padding:5px 4px">使用说明</a><div class="spacer"></div><label class="refresh"><input id="auto" type="checkbox" checked> 自动刷新</label><select id="interval" aria-label="刷新间隔"><option value="3">3 秒</option><option value="5" selected>5 秒</option><option value="10">10 秒</option><option value="30">30 秒</option></select><button id="refresh" title="刷新 (F5)">刷新</button></header>
+<header class="toolbar"><div class="title">节点调和控制台</div><div class="sep"></div><label class="field">目标节点数 <input id="target" type="number" min="0" max="1000" aria-label="目标节点数"></label><button id="saveTarget">应用</button><button id="reconcile" class="primary">立即调和</button><button id="openProxyTest">代理测试</button><button id="openBalanced">负载均衡</button><button id="openSettings">阿里云设置</button><button id="openSecurityGroup">创建安全组</button><button id="openTemplate">创建启动模板</button><a href="/help" style="color:#356b91;text-decoration:none;padding:5px 4px">使用说明</a><input id="tokenInput" type="password" maxlength="256" placeholder="API Token（远程操作需填写）" style="width:180px;font-size:12px;padding:3px 6px" title="填写 API Token 后可远程执行写操作"><button id="saveToken" title="保存 Token 到浏览器" style="padding:3px 8px;font-size:12px">解锁</button><div class="spacer"></div><label class="refresh"><input id="auto" type="checkbox" checked> 自动刷新</label><select id="interval" aria-label="刷新间隔"><option value="3">3 秒</option><option value="5" selected>5 秒</option><option value="10">10 秒</option><option value="30">30 秒</option></select><button id="refresh" title="刷新 (F5)">刷新</button></header>
 <main class="main">
 <section class="summary">
 <div class="card runtime"><span id="led" class="led"></span><div><div class="card-label">运行状态</div><div id="runtime" style="font-size:16px;font-weight:600;margin:2px 0">正在连接</div><div id="runtimeNote" class="card-note">读取控制器状态</div></div></div>
@@ -141,7 +141,7 @@ function toast(msg,bad=false){const e=$('toast');e.textContent=msg;e.className='
 function render(d){$('reconcile').disabled=!d.reconcile_enabled;$('healthy').textContent=d.stats.healthy;$('pending').textContent=d.stats.pending;$('draining').textContent=d.stats.draining;$('errors').textContent=d.stats.errors;$('aliyunState').textContent=d.aliyun_configured?'已配置':'未配置';$('runtime').textContent=d.runtime.running?'调和执行中':(d.runtime.ok?'运行正常':'需要关注');$('runtimeNote').textContent=(d.runtime.last_reconcile?'上次调和 '+new Date(d.runtime.last_reconcile).toLocaleTimeString():'等待首次调和')+(d.runtime.auto_reconcile_interval>0?(d.runtime.next_auto_reconcile?' · 下次 '+new Date(d.runtime.next_auto_reconcile).toLocaleTimeString():' · 自动调和已启用'):'');$('led').className='led '+(d.runtime.running?'busy':(d.runtime.ok?'':'error'));if(document.activeElement!==$('target'))$('target').value=d.target;lastTarget=d.target;$('adapter').textContent=d.adapter;$('pool').textContent=d.pool;$('updated').textContent='更新于 '+new Date(d.generated_at).toLocaleTimeString();$('nodeCount').textContent=d.nodes.length+' 个节点';
 $('nodes').innerHTML=d.nodes.length?d.nodes.map(n=>{const lat=n.latency_ms?n.latency_ms.toFixed(0)+'ms':'—';const geo=n.geo?`${esc(n.geo.country)} ${esc(n.geo.city||'')}`:'—';const fc=n.failure_count||0;return `<tr><td><span class="badge ${esc(n.state)}">${esc(labels[n.state]||n.state)}</span></td><td class="mono">${esc(n.instance_id)}</td><td class="mono">${esc(n.public_ip)}</td><td>${esc(n.cloud_status)}</td><td>${esc(n.zone)}</td><td class="mono">${lat}</td><td>${geo}</td><td>${fc>0?`<span class="red">${fc}</span>`:'0'}</td><td>${esc(new Date(n.created_at).toLocaleString())}</td><td><button class="node-delete" data-instance-id="${esc(n.instance_id)}" ${d.runtime.running?'disabled':''}>删除</button></td></tr>`}).join(''):'<tr><td class="empty" colspan="10">暂无节点</td></tr>';
 $('candidates').innerHTML=d.candidates.map(c=>`<div class="candidate"><div class="candidate-top"><span class="candidate-name">${esc(c.zone)}</span><span class="stock">${esc(c.availability)}</span></div><div class="candidate-meta">${esc(c.region_id)} · ${esc(c.instance_type)}<br>${esc(c.vswitch_id)}</div></div>`).join('');$('events').innerHTML=d.events.length?d.events.map(e=>`<div class="event"><time>${esc(new Date(e.time).toLocaleString())}</time>${esc(e.message)}</div>`).join(''):'<div class="event">暂无操作记录</div>'}
-async function api(path,opt){const c=new AbortController;const t=setTimeout(()=>c.abort(),60000);try{const r=await fetch(path,{...opt,signal:c.signal});const d=await r.json().catch(()=>({error:'响应格式错误'}));if(!r.ok)throw Error(d.error||`HTTP ${r.status}`);return d}catch(e){if(e.name==='AbortError')throw Error('请求超时');throw e}finally{clearTimeout(t)}}
+async function api(path,opt){const c=new AbortController;const t=setTimeout(()=>c.abort(),60000);try{const tok=localStorage.getItem('pp_token')||'';const hdrs=Object.assign({},(opt&&opt.headers)||{});if(tok)hdrs['Authorization']='Bearer '+tok;const r=await fetch(path,{...opt,headers:hdrs,signal:c.signal});const d=await r.json().catch(()=>({error:'响应格式错误'}));if(!r.ok)throw Error(d.error||`HTTP ${r.status}`);return d}catch(e){if(e.name==='AbortError')throw Error('请求超时');throw e}finally{clearTimeout(t)}}
 function renderBilling(d){$('billAvailableCash').textContent=d.available_cash_amount??'—';$('billBalance').textContent=d.balance??'—';$('billSpent').textContent=d.month_spent??'—';$('billCredit').textContent=d.credit_amount??'—';$('billCurrency').textContent=d.currency??'—';$('billCycle').textContent=d.billing_cycle??'—';$('billUpdated').textContent=d.updated_at?new Date(d.updated_at).toLocaleTimeString():'—';const bankCredit=d.mybank_credit_amount!=null?`网商银行信控 ${d.mybank_credit_amount}；`:'';$('billStatus').textContent=bankCredit+d.message+'；可用额度不等于 ECS 下单门槛，按量实例可能要求可用额度不少于 100 元；账单非实时，以费用中心出账为准'}
 async function refreshBilling(){try{renderBilling(await api('/api/billing'))}catch(e){$('billStatus').textContent='账单状态读取失败；账单非实时，以费用中心出账为准'}}
 async function refresh(silent=true){if(loading)return;loading=true;try{render(await api('/api/status'))}catch(e){$('runtime').textContent='连接失败';$('runtimeNote').textContent=e.message;$('led').className='led error';if(!silent)toast(e.message,true)}finally{loading=false}}
@@ -153,7 +153,7 @@ $('openSettings').onclick=openSettings;$('templateId').onchange=()=>{const versi
 const fillSelect=(id,items)=>{$(id).innerHTML=items.map(x=>`<option value="${esc(x.id)}">${esc(x.name)}</option>`).join('')};$('openSecurityGroup').onclick=async()=>{try{const r=await api('/api/resources');fillSelect('securityGroupVSwitchId',r.vswitches);$('securityGroupDialog').showModal()}catch(e){toast(e.message,true)}};$('cancelSecurityGroup').onclick=()=>$('securityGroupDialog').close();$('securityGroupDialog').onclick=e=>{if(e.target===$('securityGroupDialog'))$('securityGroupDialog').close()};$('securityGroupForm').onsubmit=async e=>{e.preventDefault();const body={security_group_name:$('securityGroupName').value,description:$('securityGroupDescription').value,v_switch_id:$('securityGroupVSwitchId').value};try{$('createSecurityGroup').disabled=true;const d=await api('/api/security-groups',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});$('securityGroupDialog').close();$('securityGroupForm').reset();toast(`安全组 ${d.security_group_id} 已创建`);await api('/api/resources')}catch(e){toast(e.message,true)}finally{$('createSecurityGroup').disabled=false}};$('openTemplate').onclick=async()=>{try{const r=await api('/api/resources');fillSelect('imageId',r.images);fillSelect('instanceType',r.instance_types);fillSelect('vSwitchId',r.vswitches);fillSelect('securityGroupId',r.security_groups);$('templateDialog').showModal()}catch(e){toast(e.message,true)}};$('cancelTemplate').onclick=()=>$('templateDialog').close();$('templateDialog').onclick=e=>{if(e.target===$('templateDialog'))$('templateDialog').close()};$('templateForm').onsubmit=async e=>{e.preventDefault();const body={launch_template_name:$('templateName').value,description:$('templateDescription').value,image_id:$('imageId').value,instance_type:$('instanceType').value,v_switch_id:$('vSwitchId').value,security_group_id:$('securityGroupId').value};try{$('createTemplate').disabled=true;const d=await api('/api/launch-templates',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});$('templateDialog').close();$('templateForm').reset();toast(`启动模板 ${d.launch_template_id} 已创建`);refresh(true)}catch(e){toast(e.message,true)}finally{$('createTemplate').disabled=false}};
 $('openProxyTest').onclick=async()=>{try{const d=await api('/api/status');const sel=$('testInstanceId');sel.innerHTML='<option value="">请选择节点</option>';d.nodes.filter(n=>n.state==='healthy').forEach(n=>sel.add(new Option(`${n.instance_id} (${n.public_ip})`,n.instance_id)));$('testResult').textContent='等待测试';$('proxyTestDialog').showModal()}catch(e){toast(e.message,true)}};$('cancelProxyTest').onclick=()=>$('proxyTestDialog').close();$('proxyTestDialog').onclick=e=>{if(e.target===$('proxyTestDialog'))$('proxyTestDialog').close()};$('proxyTestForm').onsubmit=async e=>{e.preventDefault();const body={instance_id:$('testInstanceId').value,target_url:$('testTargetUrl').value};if(!body.instance_id){toast('请选择节点',true);return}try{$('runProxyTest').disabled=true;$('testResult').textContent='测试中...';const d=await api('/api/proxy-test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});$('testResult').textContent=JSON.stringify(d,null,2)}catch(e){$('testResult').textContent='错误：'+e.message}finally{$('runProxyTest').disabled=false}};
 $('openBalanced').onclick=()=>{$('lbResult').textContent='尚未获取';$('balancedDialog').showModal()};$('cancelBalanced').onclick=()=>$('balancedDialog').close();$('balancedDialog').onclick=e=>{if(e.target===$('balancedDialog'))$('balancedDialog').close()};$('balancedForm').onsubmit=async e=>{e.preventDefault();const strategy=$('lbStrategy').value;try{$('getBalanced').disabled=true;const d=await api('/api/proxies/balanced',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({strategy})});$('lbResult').textContent=d.proxy||'无可用代理'}catch(e){$('lbResult').textContent='错误：'+e.message}finally{$('getBalanced').disabled=false}};
-$('saveTarget').onclick=()=>{const v=Number($('target').value);if(!Number.isInteger(v)||v<0||v>1000)return toast('目标节点数需为 0–1000 的整数',true);setBusy(true);action('/api/target',{target:v},'目标节点数已更新')};$('reconcile').onclick=()=>{setBusy(true);action('/api/reconcile',{},'调和已完成')};$('refresh').onclick=()=>{refresh(false);refreshBilling()};$('auto').onchange=schedule;$('interval').onchange=schedule;function schedule(){clearInterval(timer);if($('auto').checked)timer=setInterval(()=>refresh(true),Number($('interval').value)*1000)}document.addEventListener('keydown',e=>{if(e.key==='F5'){e.preventDefault();refresh(false);refreshBilling()}if(e.ctrlKey&&e.key==='Enter')$('reconcile').click()});refresh(false);refreshBilling();schedule();
+$('saveTarget').onclick=()=>{const v=Number($('target').value);if(!Number.isInteger(v)||v<0||v>1000)return toast('目标节点数需为 0–1000 的整数',true);setBusy(true);action('/api/target',{target:v},'目标节点数已更新')};$('reconcile').onclick=()=>{setBusy(true);action('/api/reconcile',{},'调和已完成')};$('refresh').onclick=()=>{refresh(false);refreshBilling()};$('auto').onchange=schedule;$('interval').onchange=schedule;function schedule(){clearInterval(timer);if($('auto').checked)timer=setInterval(()=>refresh(true),Number($('interval').value)*1000)}document.addEventListener('keydown',e=>{if(e.key==='F5'){e.preventDefault();refresh(false);refreshBilling()}if(e.ctrlKey&&e.key==='Enter')$('reconcile').click()});$('saveToken').onclick=()=>{const v=$('tokenInput').value.trim();if(v){localStorage.setItem('pp_token',v);$('tokenInput').value='';$('tokenInput').placeholder='Token 已保存 ✓';toast('Token 已保存，写操作已解锁')}else{localStorage.removeItem('pp_token');$('tokenInput').placeholder='API Token（远程操作需填写）';toast('Token 已清除')}};(function(){const t=localStorage.getItem('pp_token');if(t)$('tokenInput').placeholder='Token 已保存 ✓'})();refresh(false);refreshBilling();schedule();
 </script></body></html>'''
 
 
@@ -167,7 +167,7 @@ HELP_HTML = r'''<!doctype html>
 </style>
 </head>
 <body><header><strong>节点调和控制台</strong><a href="/">返回控制台</a></header><main class="page">
-<section class="intro"><h1>使用说明</h1><p>用于配置阿里云 ECS 节点、创建 Dante SOCKS5 启动模板，并安全地调和代理池规模。</p><nav aria-label="帮助目录"><a href="#configuration">配置</a><a href="#buttons">按钮说明</a><a href="#dante">Dante 模板</a><a href="#scaling">扩缩容</a><a href="#extract-socks">提取代理</a><a href="#proxy-test">代理测试</a><a href="#delete">删除</a><a href="#cost-security">费用与安全</a><a href="#troubleshooting">故障排查</a><a href="#spot-tutorial">抢占式教程</a><a href="#cost-tutorial">费用教程</a><a href="#api-control">API 控制</a></nav></section>
+<section class="intro"><h1>使用说明</h1><p>用于配置阿里云 ECS 节点、创建 Dante SOCKS5 启动模板，并安全地调和代理池规模。</p><nav aria-label="帮助目录"><a href="#configuration">配置</a><a href="#buttons">按钮说明</a><a href="#dante">Dante 模板</a><a href="#scaling">扩缩容</a><a href="#extract-socks">提取代理</a><a href="#proxy-test">代理测试</a><a href="#delete">删除</a><a href="#cost-security">费用与安全</a><a href="#troubleshooting">故障排查</a><a href="#spot-tutorial">抢占式教程</a><a href="#cost-tutorial">费用教程</a><a href="#api-control">API 控制</a><a href="#ai-prompt">AI 提示词模板</a></nav></section>
 <section class="section" id="configuration"><h2>1. 配置</h2><ol><li>在“阿里云设置”中填写专用 RAM 用户的 AccessKey、地域、启动模板、实例标签池名称；资源组和模板版本可选。</li><li>填写 SOCKS 用户名、密码和代理 API Token。秘密字段留空会保留原值；只有勾选“清除现有密钥”才会清除 AccessKey Secret。</li><li>也可通过同目录 <code>.env</code> 或系统环境变量提供配置；优先级为系统环境变量 &gt; <code>.env</code> &gt; 已保存设置。<code>.env</code> 支持的全部变量如下：</li></ol><pre># 阿里云凭据与地域（必填）
 ALIBABA_CLOUD_ACCESS_KEY_ID=LTAI...
 ALIBABA_CLOUD_ACCESS_KEY_SECRET=...
@@ -318,6 +318,170 @@ curl "http://127.0.0.1:8765/api/target?target=5&token=&lt;API_TOKEN&gt;"</pre></
 curl -H "Authorization: Bearer &lt;API_TOKEN&gt;" http://127.0.0.1:8765/api/reconcile</pre><h3>查询接口（GET）</h3><ul><li><code>GET /api/status</code> — 节点状态、统计、候选区、事件</li><li><code>GET /api/settings</code> — 当前配置概览（不返回密钥明文）</li><li><code>GET /api/billing</code> — 账户余额与当月账单</li><li><code>GET /api/resources</code> — 可用镜像、规格、交换机、安全组、启动模板</li><li><code>GET /api/proxies</code> — 当前健康代理列表（需 Token）</li><li><code>GET /api/proxies/balanced?strategy=round-robin</code> — 按策略获取单个代理（需 Token）</li></ul><h3>控制接口（GET，需 Token）</h3><ul><li><code>GET /api/reconcile</code> — 立即执行调和，返回操作后状态</li><li><code>GET /api/target?target=5</code> — 设置目标节点数（0–1000 整数），返回更新后状态</li><li><code>GET /api/nodes/delete?instance_id=i-xxx</code> — 下线并释放指定实例，返回操作后状态</li></ul><pre>curl "http://127.0.0.1:8765/api/target?target=6&token=&lt;API_TOKEN&gt;"
 curl "http://127.0.0.1:8765/api/reconcile?token=&lt;API_TOKEN&gt;"
 curl "http://127.0.0.1:8765/api/nodes/delete?instance_id=i-bp1xxx&token=&lt;API_TOKEN&gt;"</pre><p>控制接口成功时返回节点状态 JSON（与 <code>GET /api/status</code> 格式相同）。失败时返回 <code>{"error":"..."}</code> 及对应 HTTP 状态码：401（Token 无效或缺失）、400（参数错误）、409（操作冲突，如调和执行中）、500（内部错误）。</p><p class="warning">API Token 与控制台设置中的代理 API Token 相同。请通过受信网络调用，不要将 Token 写入日志或公开代码。</p></section>
+<section class="section" id="ai-prompt"><h2>13. AI 提示词模板案例</h2><p>本节提供一套面向 AI 的结构化提示词，用于通过自然语言对话引导 AI 完成安全组、交换机、实例规格等核心参数的确认，最终生成可提交到控制台的完整资源配置模板。将以下提示词复制给 AI 助手即可开始交互式配置。</p>
+
+<h3>13.1 使用方法</h3><ol><li>将下方"系统提示词"发送给 AI 助手。</li><li>AI 会逐步询问地域、安全组、交换机、实例规格等参数。</li><li>通过自然语言回答或调整，AI 会实时更新配置草案。</li><li>确认无误后，AI 输出完整的 JSON 配置模板。</li><li>将 JSON 中的参数填入控制台"阿里云设置"和"创建启动模板"对话框。</li></ol>
+
+<h3>13.2 系统提示词</h3><pre>你是 ProxyPilot 代理池的资源配置助手。你的任务是通过自然语言对话，
+帮助用户完成阿里云 ECS SOCKS5 代理池的资源配置。
+
+你需要引导用户确认以下核心参数，并最终生成完整的资源配置模板。
+
+## 需要确认的参数
+
+### 1. 地域与可用区
+- region_id：阿里云地域（如 cn-hangzhou、cn-shanghai、cn-beijing）
+- zone_id：可用区（如 cn-hangzhou-j，可通过 GET /api/resources 查询）
+
+### 2. 安全组
+- security_group_id：已有安全组 ID，或通过"创建安全组"新建
+- 安全组需开放 TCP 1080 入方向（SOCKS5 代理端口）
+- 建议：仅允许可信客户端 IP，不向全网开放
+
+### 3. 交换机（vSwitch）
+- v_switch_id：交换机 ID，需与所选地域/可用区一致
+- 可通过 GET /api/resources 查询可用交换机列表
+
+### 4. 实例规格
+- instance_type：ECS 实例规格
+- 推荐：t6-c1m1.large（2vCPU/2GiB，代理转发足够）
+- 可选：s6-c1m1.large、e-instance ecs.t6-c1m1.large 等
+- 可通过 GET /api/resources 查询可用规格
+
+### 5. 镜像
+- image_id：Ubuntu 镜像 ID（cloud-init 依赖 Ubuntu）
+- 推荐：ubuntu_22_04_x64 或 ubuntu_20_04_x64
+- 可通过 GET /api/resources 查询可用镜像
+
+### 6. SOCKS5 凭据
+- socks5_username：代理认证用户名
+- socks5_password：代理认证密码（至少 8 位，含大小写字母和数字）
+
+### 7. 计费方式
+- instance_charge_type：PostPaid（按量付费）或 Spot（抢占式）
+- spot_duration：抢占式保护期（0=无、1=1小时、6=6小时）
+- 代理池推荐：抢占式 + 无保护期（成本最低）
+
+### 8. 调和参数
+- target_nodes：目标节点数（建议 ≥ 2，保证可用性）
+- batch_size：调和批量大小（默认 3）
+- auto_reconcile_interval：自动调和间隔秒数（建议 60-300）
+- circuit_breaker_threshold：断路器阈值（建议 3-5）
+
+## 交互规则
+
+1. 每次只问 1-2 个问题，不要一次列出所有参数。
+2. 提供推荐值和说明，让用户可以简单回复"可以"或给出自定义值。
+3. 用户说"用默认值"时，使用括号中的推荐值。
+4. 收集完所有参数后，输出完整的 JSON 配置模板。
+5. 如果用户提供的参数可能有问题（如地域与交换机不匹配），主动提醒。
+
+## 对话示例
+
+用户：帮我配置一个代理池
+助手：好的！我先确认几个核心参数。
+
+首先，你打算把代理节点部署在哪个地域？
+- 华东1（杭州）· cn-hangzhou ← 推荐，资源丰富
+- 华东2（上海）· cn-shanghai
+- 华北2（北京）· cn-beijing
+- 其他地域
+
+回复地域名称或编号即可，也可以说"用默认"。
+
+用户：用默认
+助手：好的，使用华东1（杭州）cn-hangzhou。
+
+接下来确认实例规格。代理转发是 I/O 密集型任务，入门级规格即可：
+- ecs.t6-c1m1.large（2vCPU/2GiB）← 推荐，性价比最高
+- ecs.s6-c1m1.large（2vCPU/2GiB）
+- ecs.t6-c1m1.xlarge（4vCPU/4GiB）
+
+你倾向哪个？也可以说"推荐"。
+
+用户：推荐
+助手：好的，使用 ecs.t6-c1m1.large。
+
+关于计费方式，代理池适合抢占式实例（成本约按量的 10%-30%）：
+- 抢占式（无保护期）← 推荐，价格最低，多节点可容忍中断
+- 抢占式（1小时保护期），略贵但创建后1小时内不被回收
+- 按量付费，稳定但成本高
+
+你的选择？
+
+用户：抢占式无保护期
+助手：好的。
+
+最后几个参数：
+1. 目标节点数？（建议 3-5 个，保证单节点被回收后仍有可用代理）
+2. SOCKS5 用户名和密码？（用于代理认证，密码至少8位含大小写和数字）
+
+用户：3个节点，用户名 proxyuser，密码 MyProxy2026
+助手：所有参数已确认。以下是完整的资源配置模板：
+
+（输出 JSON）
+
+请将以上参数填入控制台：
+1. "阿里云设置"中填入 region_id、socks5_username、socks5_password、instance_charge_type 等。
+2. "创建安全组"中创建安全组（如尚未有）。
+3. "创建启动模板"中选择 image_id、instance_type、v_switch_id、security_group_id。
+4. 设置目标节点数为 target_nodes，点击"立即调和"。</pre>
+
+<h3>13.3 输出模板格式</h3><p>AI 确认所有参数后，会输出以下 JSON 格式的配置模板：</p><pre>{
+  "settings": {
+    "region_id": "cn-hangzhou",
+    "access_key_id": "&lt;在控制台填写&gt;",
+    "access_key_secret": "&lt;在控制台填写&gt;",
+    "pool_name": "proxy-main",
+    "socks5_username": "proxyuser",
+    "socks5_password": "&lt;已确认的密码&gt;",
+    "proxy_api_bearer_token": "&lt;在控制台填写&gt;",
+    "instance_charge_type": "Spot",
+    "spot_duration": "0",
+    "auto_reconcile_interval": "60",
+    "circuit_breaker_threshold": "3",
+    "batch_size": "3",
+    "pending_timeout_minutes": "5"
+  },
+  "launch_template": {
+    "launch_template_name": "dante-proxy-&lt;时间戳&gt;",
+    "description": "Dante SOCKS5 代理模板",
+    "image_id": "ubuntu_22_04_x64",
+    "instance_type": "ecs.t6-c1m1.large",
+    "v_switch_id": "&lt;已确认的交换机 ID&gt;",
+    "security_group_id": "&lt;已确认的安全组 ID&gt;"
+  },
+  "security_group": {
+    "security_group_name": "proxy-sg-&lt;时间戳&gt;",
+    "description": "SOCKS5 代理安全组",
+    "v_switch_id": "&lt;与启动模板相同的交换机&gt;"
+  },
+  "target_nodes": 3,
+  "post_create_steps": [
+    "1. 在'阿里云设置'中填写 settings 部分的参数并保存",
+    "2. 在'创建安全组'中创建安全组（如尚未有）",
+    "3. 在'创建启动模板'中选择镜像、规格、交换机、安全组并创建",
+    "4. 设置目标节点数为 3，点击'立即调和'",
+    "5. 等待约 60 秒后再次调和，节点应进入健康状态"
+  ]
+}</pre>
+
+<h3>13.4 快速启动提示词</h3><p>如果已有安全组和交换机，可以用以下精简提示词快速配置：</p><pre>你是 ProxyPilot 配置助手。请帮我快速配置代理池。
+
+我已有的资源：
+- 地域：cn-hangzhou
+- 交换机 ID：vsw-bpxxxxxxxxxx
+- 安全组 ID：sg-bpxxxxxxxxxx
+- 目标节点数：3
+- 计费方式：抢占式，无保护期
+- SOCKS5 用户名：proxyuser
+- SOCKS5 密码：Proxy2026!
+
+请帮我确认实例规格和镜像选择，然后输出完整的启动模板参数和设置参数，
+我直接填入控制台的'创建启动模板'和'阿里云设置'对话框。</pre>
+
+<p class="warning">提示词中的密码和 Token 为示例值，实际使用时请替换为自己的真实凭据。切勿在公共 AI 平台上发送真实 AccessKey Secret。</p>
+</section>
 </main></body></html>'''
 
 
@@ -1110,6 +1274,14 @@ class Handler(BaseHTTPRequestHandler):
             and address.ipv4_mapped.is_loopback
         )
 
+    def _is_authorized(self) -> bool:
+        """本机请求或携带有效 Bearer Token 的请求均允许写操作。"""
+        if self._is_local_request():
+            return True
+        auth = self.headers.get("Authorization", "")
+        supplied = auth[7:] if auth.startswith("Bearer ") else ""
+        return self.service.authenticate(supplied)
+
     def _body(self) -> dict[str, Any]:
         content_length = self.headers.get("Content-Length")
         if content_length is None:
@@ -1214,8 +1386,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         path = urlparse(self.path).path
         try:
-            if not self._is_local_request():
-                self._json({"error": "仅允许本机操作"}, 403)
+            if not self._is_authorized():
+                self._json({"error": "仅允许本机操作或携带有效 Token"}, 403)
                 return
             body = self._body()
             if path == "/api/target":
