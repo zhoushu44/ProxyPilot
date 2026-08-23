@@ -2,8 +2,14 @@ __pycache__/
 *.pyc
 .pytest_cache/
 .env
+.env.local
 dashboard_settings.json
 test_*.py
+_*.py
+*_out.txt
+*_output.txt
+*.dbg
+.dbg/
 ProxyPilot/
 .git/
 .gitignore

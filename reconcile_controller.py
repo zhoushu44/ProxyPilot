@@ -253,9 +253,24 @@ class ReconcileController:
                 try:
                     is_healthy, latency = self.proxy_pool.health_check(instance.public_ip)
                 except Exception as exc:
-                    errors.append(f"{instance.instance_id} 健康检查异常，保留实例: {exc}")
-                    self.state.save(self.config.pool_name, instance, "pending")
-                    pending.append(instance)
+                    errors.append(f"{instance.instance_id} 健康检查异常: {exc}")
+                    failure_count = self.state.increment_failure(instance.instance_id)
+                    self._disable(instance.instance_id, errors)
+                    if failure_count >= self.config.circuit_breaker_threshold:
+                        errors.append(
+                            f"{instance.instance_id} 连续 {failure_count} 次健康检查失败，断路器触发自动释放"
+                        )
+                        circuit_broken.append(instance.instance_id)
+                        if self._release(instance.instance_id, errors):
+                            released.append(instance.instance_id)
+                            self.state.delete(instance.instance_id)
+                    elif now - instance.created_at >= self.config.pending_timeout:
+                        if self._release(instance.instance_id, errors):
+                            released.append(instance.instance_id)
+                            self.state.delete(instance.instance_id)
+                    else:
+                        self.state.save(self.config.pool_name, instance, "pending")
+                        pending.append(instance)
                     continue
 
                 if is_healthy:

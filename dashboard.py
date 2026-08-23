@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import re
+import socket
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -15,7 +16,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 from urllib.request import urlopen
 from urllib.error import URLError
 
@@ -27,9 +28,14 @@ from reconcile_controller import (
     ReconcileResult,
     SQLiteStateStore,
 )
-from aliyun_ecs import AliyunECSAdapter
+from aliyun_ecs import (
+    AliyunECSAdapter,
+    BUILTIN_DANTE_TEMPLATE_NAME,
+    BUILTIN_WARPGATE_TEMPLATE_NAME,
+)
 from aliyun_billing import AliyunBillingAdapter
 from proxy_pool import Socks5ProxyPool
+from warpgate_pool import WarpGateProxyPool
 
 
 ENV_SETTING_NAMES = {
@@ -43,6 +49,11 @@ ENV_SETTING_NAMES = {
     "SOCKS5_CHECK_HOST": "socks5_check_host",
     "SOCKS5_CHECK_PORT": "socks5_check_port",
     "SOCKS5_TIMEOUT": "socks5_timeout",
+    "PROXY_MODE": "proxy_mode",
+    "WARP_GATE_API_PORT": "warpgate_api_port",
+    "WARP_GATE_INSTANCES": "warpgate_instances",
+    "WARP_GATE_IP_FAMILY": "warpgate_ip_family",
+    "WARP_GATE_WHITELIST_IP": "warpgate_whitelist_ip",
     "PROXY_API_BEARER_TOKEN": "proxy_api_bearer_token",
 }
 
@@ -81,11 +92,11 @@ HTML = r'''<!doctype html>
 <title>节点调和控制台</title>
 <style>
 :root{color-scheme:light;--bg:#eef1f4;--panel:#fff;--line:#ccd3da;--line2:#e4e8ec;--text:#20262d;--muted:#66717d;--blue:#426783;--blue2:#e9f0f5;--green:#34715a;--amber:#97661c;--red:#a24747;--shadow:0 1px 2px #26374612;font-family:"Segoe UI","Microsoft YaHei UI",system-ui,sans-serif;font-size:13px}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);min-width:760px}button,input,select{font:inherit}button{height:28px;border:1px solid #aeb8c1;border-radius:3px;background:#f8f9fa;color:#26313a;padding:0 10px;cursor:pointer}button:hover{background:#edf1f4}button:active{background:#e1e7eb}button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid #6d99b9;outline-offset:1px}.primary{color:#fff;background:var(--blue);border-color:#365b76}.primary:hover{background:#365d79}.danger{color:#fff;background:var(--red);border-color:#873939}.danger:hover{background:#873939}.node-delete{height:24px;color:var(--red);padding:0 8px}button:disabled{opacity:.55;cursor:not-allowed}.app{height:100vh;display:grid;grid-template-rows:42px 1fr 24px}.toolbar{display:flex;align-items:center;gap:8px;padding:6px 12px;background:#f8f9fb;border-bottom:1px solid var(--line);box-shadow:var(--shadow)}.title{font-weight:600;font-size:14px;margin-right:10px;white-space:nowrap}.sep{width:1px;height:20px;background:var(--line);margin:0 3px}.field{display:flex;align-items:center;gap:6px;color:var(--muted);white-space:nowrap}.field input{width:64px;height:28px;border:1px solid #adb7c0;border-radius:3px;padding:0 7px;background:#fff}.spacer{flex:1}.refresh{display:flex;align-items:center;gap:5px;color:var(--muted);white-space:nowrap}.refresh select{height:28px;border:1px solid #adb7c0;border-radius:3px;background:#fff;padding:0 4px}.main{padding:10px 12px;overflow:auto;display:grid;grid-template-rows:auto minmax(280px,1fr);gap:10px}.summary{display:grid;grid-template-columns:1.35fr repeat(4,minmax(112px,1fr));gap:8px}.card{background:var(--panel);border:1px solid var(--line);border-radius:3px;box-shadow:var(--shadow);min-height:72px;padding:9px 11px}.runtime{display:flex;align-items:center;gap:10px}.led{width:10px;height:10px;border-radius:50%;background:var(--green);box-shadow:0 0 0 3px #34715a1d}.led.busy{background:var(--amber);animation:pulse 1s infinite}.led.error{background:var(--red)}@keyframes pulse{50%{opacity:.45}}.card-label{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.3px}.card-value{font-size:22px;font-weight:600;line-height:27px;font-variant-numeric:tabular-nums}.billing{grid-column:1/-1;display:grid;grid-template-columns:repeat(7,1fr);gap:12px;min-height:64px}.billing .card-value{font-size:17px}.billing-warning{grid-column:1/-1;color:var(--amber);font-size:11px}.card-note{font-size:11px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.green{color:var(--green)}.amber{color:var(--amber)}.red{color:var(--red)}.workspace{display:grid;grid-template-columns:minmax(560px,1fr) 270px;gap:10px;min-height:0}.panel{background:var(--panel);border:1px solid var(--line);border-radius:3px;box-shadow:var(--shadow);min-height:0;display:flex;flex-direction:column}.panel-head{height:36px;display:flex;align-items:center;padding:0 10px;border-bottom:1px solid var(--line);font-weight:600}.panel-head small{font-weight:400;color:var(--muted);margin-left:7px}.table-wrap{overflow:auto;flex:1}table{width:100%;border-collapse:collapse;font-size:12px}th{position:sticky;top:0;background:#f4f6f8;color:#56616c;text-align:left;font-size:11px;font-weight:600;height:29px;border-bottom:1px solid var(--line);padding:0 9px;white-space:nowrap}td{height:34px;padding:0 9px;border-bottom:1px solid var(--line2);white-space:nowrap}tbody tr:hover{background:#f5f8fa}.mono{font-family:Consolas,"SFMono-Regular",monospace;font-size:11px}.badge{display:inline-flex;align-items:center;gap:5px;border-radius:10px;padding:2px 7px;background:#edf0f2;color:#58636d}.badge:before{content:"";width:6px;height:6px;border-radius:50%;background:#87919a}.badge.healthy{background:#e8f3ee;color:#286149}.badge.healthy:before{background:#3b8466}.badge.pending{background:#fbf2df;color:#805715}.badge.pending:before{background:#c48929}.badge.draining,.badge.error{background:#f7eaea;color:#883e3e}.badge.draining:before,.badge.error:before{background:#b95050}.empty{text-align:center;color:var(--muted);padding:36px!important}.side{display:grid;grid-template-rows:minmax(190px,1fr) minmax(130px,.65fr);gap:10px;min-height:0}.candidate-list,.event-list{overflow:auto}.candidate{padding:9px 10px;border-bottom:1px solid var(--line2)}.candidate-top{display:flex;justify-content:space-between;gap:6px}.candidate-name{font-weight:600}.candidate-meta{font-size:11px;color:var(--muted);margin-top:4px}.stock{font-size:11px;color:var(--green)}.event{padding:7px 10px;border-bottom:1px solid var(--line2);font-size:11px}.event time{display:block;color:var(--muted);margin-bottom:2px}.statusbar{display:flex;align-items:center;gap:12px;padding:0 12px;background:#e4e8ec;border-top:1px solid #c4cbd2;color:#56616b;font-size:11px}.statusbar .right{margin-left:auto}dialog{width:520px;max-width:calc(100vw - 30px);max-height:calc(100vh - 30px);border:1px solid #aeb8c1;border-radius:4px;padding:0;box-shadow:0 10px 35px #0005;color:var(--text)}dialog>form{max-height:calc(100vh - 32px);display:flex;flex-direction:column}dialog::backdrop{background:#26374655}.dialog-head{height:38px;display:flex;align-items:center;padding:0 12px;border-bottom:1px solid var(--line);font-weight:600}.settings-form{padding:10px 12px;display:grid;grid-template-columns:145px 1fr;gap:8px 10px;align-items:center;overflow-y:auto}.settings-form label{color:#4d5964}.settings-form input,.settings-form select{height:28px;border:1px solid #adb7c0;border-radius:3px;padding:0 7px;min-width:0;background:#fff}.settings-note{grid-column:1/-1;padding:7px 8px;background:var(--blue2);color:#536574;border:1px solid #d5e0e8;font-size:11px}.settings-help{grid-column:1/-1;border:1px solid var(--line);background:#fafbfc;padding:8px 10px;font-size:11px;color:#53606b}.settings-help-title{font-weight:600;color:#34424e;margin-bottom:5px}.settings-help ol{margin:0;padding-left:18px}.settings-help li{margin:4px 0;line-height:1.45}.settings-help a{color:#356b91;text-decoration:none}.settings-help a:hover{text-decoration:underline}.settings-help .warning{color:#8a5a16}.permission-box{margin:6px 0;padding:7px 8px;background:#f2f4f6;border:1px solid #d8dde2}.permission-box summary{cursor:pointer;font-weight:600;color:#3d4c58}.permission-box pre{margin:7px 0 0;max-height:190px;overflow:auto;padding:7px;background:#20272e;color:#e6edf2;font:10px/1.45 Consolas,monospace;white-space:pre-wrap}.permission-list{margin:5px 0 0!important;columns:2;column-gap:18px}.permission-list li{break-inside:avoid;font-family:Consolas,monospace;font-size:10px}.secret-state{font-size:11px;color:var(--muted)}.dialog-actions{height:42px;display:flex;align-items:center;justify-content:flex-end;gap:7px;padding:0 12px;border-top:1px solid var(--line);background:#f7f8f9}.toast{position:fixed;right:14px;bottom:34px;max-width:360px;background:#28333c;color:#fff;padding:8px 11px;border-radius:3px;box-shadow:0 4px 16px #0003;opacity:0;transform:translateY(5px);pointer-events:none;transition:.16s}.toast.show{opacity:1;transform:none}.toast.bad{background:#8a3e3e}@media(max-width:1000px){.summary{grid-template-columns:1.4fr repeat(2,1fr)}.workspace{grid-template-columns:1fr}.side{grid-template-columns:1fr 1fr;grid-template-rows:220px}.main{display:block}.summary,.workspace{margin-bottom:10px}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);min-width:0}button,input,select{font:inherit}button{height:28px;border:1px solid #aeb8c1;border-radius:3px;background:#f8f9fa;color:#26313a;padding:0 10px;cursor:pointer}button:hover{background:#edf1f4}button:active{background:#e1e7eb}button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid #6d99b9;outline-offset:1px}.primary{color:#fff;background:var(--blue);border-color:#365b76}.primary:hover{background:#365d79}.danger{color:#fff;background:var(--red);border-color:#873939}.danger:hover{background:#873939}.node-delete{height:24px;color:var(--red);padding:0 8px}button:disabled{opacity:.55;cursor:not-allowed}.app{height:100vh;display:grid;grid-template-rows:42px 1fr 24px}.toolbar{display:flex;align-items:center;gap:8px;padding:6px 12px;background:#f8f9fb;border-bottom:1px solid var(--line);box-shadow:var(--shadow)}.title{font-weight:600;font-size:14px;margin-right:10px;white-space:nowrap}.sep{width:1px;height:20px;background:var(--line);margin:0 3px}.field{display:flex;align-items:center;gap:6px;color:var(--muted);white-space:nowrap}.field input{width:64px;height:28px;border:1px solid #adb7c0;border-radius:3px;padding:0 7px;background:#fff}.spacer{flex:1}.refresh{display:flex;align-items:center;gap:5px;color:var(--muted);white-space:nowrap}.refresh select{height:28px;border:1px solid #adb7c0;border-radius:3px;background:#fff;padding:0 4px}.main{padding:10px 12px;overflow:auto;display:grid;grid-template-rows:auto minmax(280px,1fr);gap:10px}.summary{display:grid;grid-template-columns:1.35fr repeat(4,minmax(112px,1fr));gap:8px}.card{background:var(--panel);border:1px solid var(--line);border-radius:3px;box-shadow:var(--shadow);min-height:72px;padding:9px 11px}.runtime{display:flex;align-items:center;gap:10px}.led{width:10px;height:10px;border-radius:50%;background:var(--green);box-shadow:0 0 0 3px #34715a1d}.led.busy{background:var(--amber);animation:pulse 1s infinite}.led.error{background:var(--red)}@keyframes pulse{50%{opacity:.45}}.card-label{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.3px}.card-value{font-size:22px;font-weight:600;line-height:27px;font-variant-numeric:tabular-nums}.billing{grid-column:1/-1;display:grid;grid-template-columns:repeat(7,1fr);gap:12px;min-height:64px}.billing .card-value{font-size:17px}.billing-warning{grid-column:1/-1;color:var(--amber);font-size:11px}.card-note{font-size:11px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.green{color:var(--green)}.amber{color:var(--amber)}.red{color:var(--red)}.workspace{display:grid;grid-template-columns:minmax(560px,1fr) 270px;gap:10px;min-height:0}.panel{background:var(--panel);border:1px solid var(--line);border-radius:3px;box-shadow:var(--shadow);min-height:0;display:flex;flex-direction:column}.panel-head{height:36px;display:flex;align-items:center;padding:0 10px;border-bottom:1px solid var(--line);font-weight:600}.panel-head small{font-weight:400;color:var(--muted);margin-left:7px}.table-wrap{overflow:auto;flex:1}table{width:100%;border-collapse:collapse;font-size:12px}th{position:sticky;top:0;background:#f4f6f8;color:#56616c;text-align:left;font-size:11px;font-weight:600;height:29px;border-bottom:1px solid var(--line);padding:0 9px;white-space:nowrap}td{height:34px;padding:0 9px;border-bottom:1px solid var(--line2);white-space:nowrap}tbody tr:hover{background:#f5f8fa}.mono{font-family:Consolas,"SFMono-Regular",monospace;font-size:11px}.badge{display:inline-flex;align-items:center;gap:5px;border-radius:10px;padding:2px 7px;background:#edf0f2;color:#58636d}.badge:before{content:"";width:6px;height:6px;border-radius:50%;background:#87919a}.badge.healthy{background:#e8f3ee;color:#286149}.badge.healthy:before{background:#3b8466}.badge.pending{background:#fbf2df;color:#805715}.badge.pending:before{background:#c48929}.badge.draining,.badge.error{background:#f7eaea;color:#883e3e}.badge.draining:before,.badge.error:before{background:#b95050}.empty{text-align:center;color:var(--muted);padding:36px!important}.side{display:grid;grid-template-rows:minmax(190px,1fr) minmax(130px,.65fr);gap:10px;min-height:0}.candidate-list,.event-list{overflow:auto}.candidate{padding:9px 10px;border-bottom:1px solid var(--line2)}.candidate-top{display:flex;justify-content:space-between;gap:6px}.candidate-name{font-weight:600}.candidate-meta{font-size:11px;color:var(--muted);margin-top:4px}.stock{font-size:11px;color:var(--green)}.event{padding:7px 10px;border-bottom:1px solid var(--line2);font-size:11px}.event time{display:block;color:var(--muted);margin-bottom:2px}.statusbar{display:flex;align-items:center;gap:12px;padding:0 12px;background:#e4e8ec;border-top:1px solid #c4cbd2;color:#56616b;font-size:11px}.statusbar .right{margin-left:auto}dialog{width:520px;max-width:calc(100vw - 30px);max-height:calc(100vh - 30px);border:1px solid #aeb8c1;border-radius:4px;padding:0;box-shadow:0 10px 35px #0005;color:var(--text)}dialog>form{max-height:calc(100vh - 32px);display:flex;flex-direction:column}dialog::backdrop{background:#26374655}.dialog-head{height:38px;display:flex;align-items:center;padding:0 12px;border-bottom:1px solid var(--line);font-weight:600}.settings-form{padding:10px 12px;display:grid;grid-template-columns:145px 1fr;gap:8px 10px;align-items:center;overflow-y:auto}.settings-form label{color:#4d5964}.help-tip{display:inline-flex;align-items:center;justify-content:center;width:15px;height:15px;margin-left:4px;border:1px solid #8ea1b0;border-radius:50%;color:#587185;font-size:10px;font-weight:700;cursor:help;vertical-align:middle}.settings-form input,.settings-form select{height:28px;border:1px solid #adb7c0;border-radius:3px;padding:0 7px;min-width:0;background:#fff}.mode-banner{grid-column:1/-1;padding:8px 10px;border:1px solid #cbdce8;background:#f0f6fa;color:#405c70}.mode-banner strong{color:#2f5873}.mode-only{display:contents}.hidden-mode{display:none!important}.settings-note{grid-column:1/-1;padding:7px 8px;background:var(--blue2);color:#536574;border:1px solid #d5e0e8;font-size:11px}.settings-help{grid-column:1/-1;border:1px solid var(--line);background:#fafbfc;padding:8px 10px;font-size:11px;color:#53606b}.settings-help-title{font-weight:600;color:#34424e;margin-bottom:5px}.settings-help ol{margin:0;padding-left:18px}.settings-help li{margin:4px 0;line-height:1.45}.settings-help a{color:#356b91;text-decoration:none}.settings-help a:hover{text-decoration:underline}.settings-help .warning{color:#8a5a16}.permission-box{margin:6px 0;padding:7px 8px;background:#f2f4f6;border:1px solid #d8dde2}.permission-box summary{cursor:pointer;font-weight:600;color:#3d4c58}.permission-box pre{margin:7px 0 0;max-height:190px;overflow:auto;padding:7px;background:#20272e;color:#e6edf2;font:10px/1.45 Consolas,monospace;white-space:pre-wrap}.permission-list{margin:5px 0 0!important;columns:2;column-gap:18px}.permission-list li{break-inside:avoid;font-family:Consolas,monospace;font-size:10px}.secret-state{font-size:11px;color:var(--muted)}.dialog-actions{height:42px;display:flex;align-items:center;justify-content:flex-end;gap:7px;padding:0 12px;border-top:1px solid var(--line);background:#f7f8f9}.toast{position:fixed;right:14px;bottom:34px;max-width:360px;background:#28333c;color:#fff;padding:8px 11px;border-radius:3px;box-shadow:0 4px 16px #0003;opacity:0;transform:translateY(5px);pointer-events:none;transition:.16s}.toast.show{opacity:1;transform:none}.toast.bad{background:#8a3e3e}@media(max-width:1000px){.summary{grid-template-columns:1.4fr repeat(2,1fr)}.workspace{grid-template-columns:1fr}.side{grid-template-columns:1fr 1fr;grid-template-rows:220px}.main{display:block}.summary,.workspace{margin-bottom:10px}}
 </style>
 </head>
-<body><div class="app">
-<header class="toolbar"><div class="title">节点调和控制台</div><div class="sep"></div><label class="field">目标节点数 <input id="target" type="number" min="0" max="1000" aria-label="目标节点数"></label><button id="saveTarget">应用</button><button id="reconcile" class="primary">立即调和</button><button id="openProxyTest">代理测试</button><button id="openBalanced">负载均衡</button><button id="openSettings">阿里云设置</button><button id="openSecurityGroup">创建安全组</button><button id="openTemplate">创建启动模板</button><a href="/help" style="color:#356b91;text-decoration:none;padding:5px 4px">使用说明</a><input id="tokenInput" type="password" maxlength="256" placeholder="API Token（远程操作需填写）" style="width:180px;font-size:12px;padding:3px 6px" title="填写 API Token 后可远程执行写操作"><button id="saveToken" title="保存 Token 到浏览器" style="padding:3px 8px;font-size:12px">解锁</button><div class="spacer"></div><label class="refresh"><input id="auto" type="checkbox" checked> 自动刷新</label><select id="interval" aria-label="刷新间隔"><option value="3">3 秒</option><option value="5" selected>5 秒</option><option value="10">10 秒</option><option value="30">30 秒</option></select><button id="refresh" title="刷新 (F5)">刷新</button></header>
+<body><div id="loginScreen" style="position:fixed;inset:0;display:flex;align-items:center;justify-content:center;background:var(--bg);z-index:20"><form id="loginForm" style="width:320px;max-width:calc(100vw - 30px);padding:22px;background:#fff;border:1px solid var(--line);border-radius:4px;box-shadow:var(--shadow)"><h2 style="margin:0 0 16px">节点调和控制台</h2><label style="display:block;color:var(--muted);margin-bottom:6px" for="loginKey">登录 Key</label><input id="loginKey" type="password" autocomplete="current-password" required style="width:100%;height:32px;border:1px solid #adb7c0;border-radius:3px;padding:0 8px" placeholder="请输入登录 Key"><div id="loginError" style="min-height:20px;margin-top:8px;color:var(--red);font-size:12px"></div><button class="primary" type="submit" style="width:100%;margin-top:6px">登录</button></form></div><div id="appShell" style="display:none"><div class="app">
+<header class="toolbar"><div class="title">节点调和控制台</div><div class="sep"></div><label class="field">目标节点数 <input id="target" type="number" min="0" max="1000" aria-label="目标节点数"></label><button id="reconcile" class="primary">立即调和</button><button id="openBalanced">负载均衡</button><button id="openSettings">阿里云设置</button><a href="/help" style="color:#356b91;text-decoration:none;padding:5px 4px">使用说明</a><div class="spacer"></div><button id="logout">退出登录</button></header>
 <main class="main">
 <section class="summary">
 <div class="card runtime"><span id="led" class="led"></span><div><div class="card-label">运行状态</div><div id="runtime" style="font-size:16px;font-weight:600;margin:2px 0">正在连接</div><div id="runtimeNote" class="card-note">读取控制器状态</div></div></div>
@@ -95,10 +106,10 @@ HTML = r'''<!doctype html>
 <div class="card"><div class="card-label">错误</div><div id="errors" class="card-value red">—</div><div class="card-note">最近一次调和</div></div>
 <div class="card billing"><div><div class="card-label">账户余额（可用现金）</div><div id="billAvailableCash" class="card-value">—</div></div><div><div class="card-label">账户可用额度</div><div id="billBalance" class="card-value">—</div></div><div><div class="card-label">当月已花费</div><div id="billSpent" class="card-value">—</div></div><div><div class="card-label">信控额度</div><div id="billCredit" class="card-value">—</div></div><div><div class="card-label">币种</div><div id="billCurrency" class="card-value">—</div></div><div><div class="card-label">账期</div><div id="billCycle" class="card-value">—</div></div><div><div class="card-label">API 更新时间</div><div id="billUpdated" class="card-value">—</div></div><div id="billStatus" class="billing-warning">正在读取费用中心；账单非实时，以费用中心出账为准</div></div>
 </section>
-<section class="workspace"><div class="panel"><div class="panel-head">节点列表 <small id="nodeCount">0 个节点</small></div><div class="table-wrap"><table><thead><tr><th>状态</th><th>实例 ID</th><th>公网 IP</th><th>云状态</th><th>可用区</th><th>延迟</th><th>归属地</th><th>失败</th><th>创建时间</th><th>操作</th></tr></thead><tbody id="nodes"></tbody></table></div></div>
+<section class="workspace"><div class="panel"><div class="panel-head">节点列表 <small id="nodeCount">0 个节点</small><span class="spacer"></span><button id="batchTest" disabled>测试选中</button><button id="batchDelete" class="danger" disabled>删除选中</button></div><div class="table-wrap"><table><thead><tr><th><input id="selectAllNodes" type="checkbox" title="全选节点"></th><th>状态</th><th>实例 ID</th><th>公网 IP</th><th>云状态</th><th>可用区</th><th>延迟</th><th>归属地</th><th>失败</th><th>创建时间</th><th>操作</th></tr></thead><tbody id="nodes"></tbody></table></div></div>
 <aside class="side"><div class="panel"><div class="panel-head">候选可用区 <small>按顺序故障转移</small></div><div id="candidates" class="candidate-list"></div></div><div class="panel"><div class="panel-head">最近事件</div><div id="events" class="event-list"></div></div></aside></section>
-</main><footer class="statusbar"><span>适配器：<b id="adapter">—</b></span><span>池：<b id="pool">—</b></span><span>阿里云：<b id="aliyunState">未配置</b></span><span class="right" id="updated">尚未刷新</span></footer></div><div id="toast" class="toast" role="status"></div>
-<dialog id="settingsDialog"><form id="settingsForm"><div class="dialog-head">阿里云设置</div><div class="settings-form"><label for="akId">AccessKey ID</label><input id="akId" maxlength="128" autocomplete="off" placeholder="输入新 AccessKey ID"><label for="akSecret">AccessKey Secret</label><div><input id="akSecret" type="password" maxlength="256" autocomplete="new-password" placeholder="留空保持现有密钥" style="width:100%"><div id="secretState" class="secret-state">密钥未配置</div></div><label for="regionId">地域</label><select id="regionId" required><option value="">请选择地域</option><option value="cn-qingdao">华北 1（青岛） · cn-qingdao</option><option value="cn-beijing">华北 2（北京） · cn-beijing</option><option value="cn-zhangjiakou">华北 3（张家口） · cn-zhangjiakou</option><option value="cn-huhehaote">华北 5（呼和浩特） · cn-huhehaote</option><option value="cn-wulanchabu">华北 6（乌兰察布） · cn-wulanchabu</option><option value="cn-hangzhou">华东 1（杭州） · cn-hangzhou</option><option value="cn-shanghai">华东 2（上海） · cn-shanghai</option><option value="cn-nanjing">华东 5（南京） · cn-nanjing</option><option value="cn-fuzhou">华东 6（福州） · cn-fuzhou</option><option value="cn-shenzhen">华南 1（深圳） · cn-shenzhen</option><option value="cn-heyuan">华南 2（河源） · cn-heyuan</option><option value="cn-guangzhou">华南 3（广州） · cn-guangzhou</option><option value="cn-chengdu">西南 1（成都） · cn-chengdu</option><option value="cn-hongkong">中国香港 · cn-hongkong</option><option value="ap-southeast-1">新加坡 · ap-southeast-1</option><option value="ap-southeast-3">马来西亚（吉隆坡） · ap-southeast-3</option><option value="ap-southeast-5">印度尼西亚（雅加达） · ap-southeast-5</option><option value="ap-southeast-6">菲律宾（马尼拉） · ap-southeast-6</option><option value="ap-southeast-7">泰国（曼谷） · ap-southeast-7</option><option value="ap-northeast-1">日本（东京） · ap-northeast-1</option><option value="ap-northeast-2">韩国（首尔） · ap-northeast-2</option><option value="us-west-1">美国（硅谷） · us-west-1</option><option value="us-east-1">美国（弗吉尼亚） · us-east-1</option><option value="eu-central-1">德国（法兰克福） · eu-central-1</option><option value="eu-west-1">英国（伦敦） · eu-west-1</option><option value="me-east-1">阿联酋（迪拜） · me-east-1</option></select><label for="templateId">启动模板 ID</label><select id="templateId"><option value="">请选择启动模板</option></select><label for="templateVersion">启动模板版本（可选）</label><input id="templateVersion" maxlength="128"><label for="resourceGroupId">资源组 ID（可选）</label><input id="resourceGroupId" maxlength="128"><label for="poolName">实例标签池名称</label><select id="poolName" required></select><label for="socksUsername">SOCKS 用户名</label><input id="socksUsername" maxlength="32" autocomplete="username"><label for="socksPassword">SOCKS 密码</label><div><input id="socksPassword" type="password" maxlength="256" autocomplete="new-password" placeholder="留空保持现有密码" style="width:100%"><div id="socksPasswordState" class="secret-state">密码未配置</div></div><label for="proxyApiToken">API Token</label><div><input id="proxyApiToken" type="password" maxlength="256" autocomplete="new-password" placeholder="留空保持现有 Token" style="width:100%"><div id="proxyApiTokenState" class="secret-state">Token 未配置</div></div><label for="clearSecret">清除现有密钥</label><input id="clearSecret" type="checkbox" style="width:auto;justify-self:start"><label for="batchSize">调和批量大小</label><input id="batchSize" type="number" min="1" max="50" placeholder="3"><label for="pendingTimeout">启动超时（分钟）</label><input id="pendingTimeout" type="number" min="1" max="120" placeholder="5"><label for="autoReconcileInterval">自动调和间隔（秒）</label><input id="autoReconcileInterval" type="number" min="0" max="3600" placeholder="0=关闭"><label for="circuitBreakerThreshold">断路器阈值</label><input id="circuitBreakerThreshold" type="number" min="1" max="20" placeholder="3"><label for="instanceChargeType">实例计费方式</label><select id="instanceChargeType"><option value="PostPaid">按量付费</option><option value="Spot">抢占式</option></select><label for="spotDuration">抢占式保护期</label><select id="spotDuration"><option value="0">无保护期（价格最低）</option><option value="1">1 小时保护期</option><option value="6">6 小时保护期</option></select><div class="settings-note">可先保存非敏感配置。只有 AccessKey、地域、启动模板和池名称完整且校验成功后才激活阿里云 ECS；系统不会生成凭据。自动调和间隔设为 0 则关闭定时调和。断路器阈值达到后自动释放故障节点。</div><div class="settings-help"><div class="settings-help-title">获取方法（点击链接将在新标签页打开阿里云官方页面）</div><ol><li><b>AccessKey：</b>进入 <a href="https://ram.console.aliyun.com/users" target="_blank" rel="noopener noreferrer">RAM 用户控制台</a>，创建专用 RAM 用户并生成 AccessKey；Secret 只显示一次，请立即保存。随后在“权限管理 → 权限策略”创建自定义策略，并将策略授权给该用户。查看 <a href="https://help.aliyun.com/zh/ram/user-guide/accesskey-pair-management/" target="_blank" rel="noopener noreferrer">创建 AccessKey</a>、<a href="https://help.aliyun.com/zh/ram/create-a-custom-policy" target="_blank" rel="noopener noreferrer">创建自定义策略</a>和<a href="https://help.aliyun.com/zh/ram/user-guide/grant-permissions-to-the-ram-user" target="_blank" rel="noopener noreferrer">为用户授权</a>。<div class="permission-box"><b>本控制器建议的最小权限</b><ul class="permission-list"><li>ecs:RunInstances</li><li>ecs:DescribeInstances</li><li>ecs:DeleteInstances</li><li>ecs:CreateLaunchTemplate</li><li>ecs:DescribeLaunchTemplates</li><li>ecs:DescribeLaunchTemplateVersions</li><li>ecs:DescribeImages</li><li>ecs:DescribeSecurityGroups</li><li>ecs:CreateSecurityGroup</li><li>ecs:DeleteSecurityGroup（可选）</li><li>ecs:DescribeKeyPairs</li><li>ecs:DescribeTags</li><li>vpc:DescribeVpcs</li><li>vpc:DescribeVSwitches</li><li>ecs:DescribeInstanceHistoryEvents</li><li>bssapi:QueryAccountBalance</li><li>bssapi:QueryBillOverview</li></ul><span class="warning">BSS 两项只读权限用于余额与账单展示；最后一项 ECS 权限用于查询创建失败和系统事件，若只依赖 DescribeInstances 的 Recycling 锁可暂不授予。若启动模板引用实例 RAM 角色，还需 ram:PassRole。</span><details><summary>展开可复制的 RAM Policy JSON</summary><pre>{
+</main><footer class="statusbar"><span>适配器：<b id="adapter">—</b></span><span>池：<b id="pool">—</b></span><span>阿里云：<b id="aliyunState">未配置</b></span><span class="right" id="updated">尚未刷新</span></footer></div><div id="toast" class="toast" role="status"></div></div></div>
+<dialog id="settingsDialog"><form id="settingsForm"><div class="dialog-head">阿里云设置</div><div class="settings-form"><label for="akId">AccessKey ID</label><input id="akId" maxlength="128" autocomplete="off" placeholder="输入新 AccessKey ID"><label for="akSecret">AccessKey Secret</label><div><input id="akSecret" type="password" maxlength="256" autocomplete="new-password" placeholder="留空保持现有密钥" style="width:100%"><div id="secretState" class="secret-state">密钥未配置</div></div><label for="regionId">地域</label><select id="regionId" required><option value="">请选择地域</option><option value="cn-qingdao">华北 1（青岛） · cn-qingdao</option><option value="cn-beijing">华北 2（北京） · cn-beijing</option><option value="cn-zhangjiakou">华北 3（张家口） · cn-zhangjiakou</option><option value="cn-huhehaote">华北 5（呼和浩特） · cn-huhehaote</option><option value="cn-wulanchabu">华北 6（乌兰察布） · cn-wulanchabu</option><option value="cn-hangzhou">华东 1（杭州） · cn-hangzhou</option><option value="cn-shanghai">华东 2（上海） · cn-shanghai</option><option value="cn-nanjing">华东 5（南京） · cn-nanjing</option><option value="cn-fuzhou">华东 6（福州） · cn-fuzhou</option><option value="cn-shenzhen">华南 1（深圳） · cn-shenzhen</option><option value="cn-heyuan">华南 2（河源） · cn-heyuan</option><option value="cn-guangzhou">华南 3（广州） · cn-guangzhou</option><option value="cn-chengdu">西南 1（成都） · cn-chengdu</option><option value="cn-hongkong">中国香港 · cn-hongkong</option><option value="ap-southeast-1">新加坡 · ap-southeast-1</option><option value="ap-southeast-3">马来西亚（吉隆坡） · ap-southeast-3</option><option value="ap-southeast-5">印度尼西亚（雅加达） · ap-southeast-5</option><option value="ap-southeast-6">菲律宾（马尼拉） · ap-southeast-6</option><option value="ap-southeast-7">泰国（曼谷） · ap-southeast-7</option><option value="ap-northeast-1">日本（东京） · ap-northeast-1</option><option value="ap-northeast-2">韩国（首尔） · ap-northeast-2</option><option value="us-west-1">美国（硅谷） · us-west-1</option><option value="us-east-1">美国（弗吉尼亚） · us-east-1</option><option value="eu-central-1">德国（法兰克福） · eu-central-1</option><option value="eu-west-1">英国（伦敦） · eu-west-1</option><option value="me-east-1">阿联酋（迪拜） · me-east-1</option></select><label for="templateId" title="选择内置 Dante 或 WarpGate 模板；缺失时系统会在当前账号自动创建。">启动模板<span class="help-tip">?</span></label><select id="templateId"><option value="">请选择启动模板</option></select><div id="templateModeHint" class="mode-banner"><strong>内置模板</strong>：ProxyPilot-Dante 为单出口 SOCKS5；ProxyPilot-WarpGate 为多出口代理。</div><label for="templateVersion" title="启动模板有多个版本时，指定要使用的版本；不确定时留空，使用默认版本。">启动模板版本（可选）<span class="help-tip">?</span></label><input id="templateVersion" maxlength="128"><label for="resourceGroupId" title="用于给阿里云资源分类管理；个人使用不需要填写。">资源组 ID（可选）<span class="help-tip">?</span></label><input id="resourceGroupId" maxlength="128"><label for="poolName" title="用于给本次调和创建的 ECS 统一打标签和归类。保持默认即可，不需要每次修改。">实例标签池名称<span class="help-tip">?</span></label><select id="poolName" required></select><div class="mode-only" data-mode="warpgate"><label for="warpgateApiPort">WarpGate API 端口</label><input id="warpgateApiPort" type="number" min="1" max="65535" value="4433"><label for="warpgateInstances">每台 ECS 出口数</label><input id="warpgateInstances" type="number" min="1" max="200" value="20"><label for="warpgateIpFamily">提取 IP 类型</label><select id="warpgateIpFamily"><option value="both">IPv4 + IPv6</option><option value="ipv4">仅 IPv4</option><option value="ipv6">仅 IPv6</option></select><label for="warpgateWhitelistIp">控制端公网 IP/CIDR</label><input id="warpgateWhitelistIp" maxlength="128" placeholder="例如 183.138.40.230/32"></div><div class="mode-only" data-mode="socks5"><label for="socksUsername">SOCKS 用户名</label><input id="socksUsername" maxlength="32" autocomplete="username"><label for="socksPassword">SOCKS 密码</label><div><input id="socksPassword" type="password" maxlength="256" autocomplete="new-password" placeholder="留空保持现有密码" style="width:100%"><div id="socksPasswordState" class="secret-state">密码未配置</div></div></div><label for="proxyApiToken">登录 API Key</label><div><input id="proxyApiToken" type="password" maxlength="256" autocomplete="new-password" placeholder="留空保持现有 Key" style="width:100%"><div id="proxyApiTokenState" class="secret-state">Key 已配置</div></div><label for="clearSecret">清除现有密钥</label><input id="clearSecret" type="checkbox" style="width:auto;justify-self:start"><label for="batchSize" title="每次调和最多同时创建或处理的 ECS 数量。数值越大速度越快，但同时占用的云资源也越多。建议保持 3。">调和批量大小<span class="help-tip">?</span></label><input id="batchSize" type="number" min="1" max="50" placeholder="3"><label for="pendingTimeout" title="ECS 启动后等待变为健康状态的最长时间。WarpGate 需要安装 Docker 和初始化出口，建议设置 10–15 分钟。">启动超时（分钟）<span class="help-tip">?</span></label><input id="pendingTimeout" type="number" min="1" max="120" placeholder="5"><label for="autoReconcileInterval" title="系统自动检查并调整节点数量的间隔。设置为 0 表示关闭自动调和，只在点击“立即调和”时执行。">自动调和间隔（秒）<span class="help-tip">?</span></label><input id="autoReconcileInterval" type="number" min="0" max="3600" placeholder="0=关闭"><label for="circuitBreakerThreshold" title="连续失败达到此次数后，系统暂时停止继续调和，避免反复创建失败的 ECS。建议保持 3。">断路器阈值<span class="help-tip">?</span></label><input id="circuitBreakerThreshold" type="number" min="1" max="20" placeholder="3"><label for="instanceChargeType" title="选择 ECS 的计费方式。按量付费更稳定；抢占式价格较低，但阿里云可能随时回收实例。">实例计费方式<span class="help-tip">?</span></label><select id="instanceChargeType"><option value="PostPaid">按量付费</option><option value="Spot">抢占式</option></select><label for="spotDuration" title="抢占式实例的价格保护时间。无保护期价格最低；保护期越长，价格通常越高。">抢占式保护期<span class="help-tip">?</span></label><select id="spotDuration"><option value="0">无保护期（价格最低）</option><option value="1">1 小时保护期</option><option value="6">6 小时保护期</option></select><div class="settings-note">可先保存非敏感配置。只有 AccessKey、地域、启动模板和池名称完整且校验成功后才激活阿里云 ECS；系统不会生成凭据。自动调和间隔设为 0 则关闭定时调和。断路器阈值达到后自动释放故障节点。</div><div class="settings-help"><div class="settings-help-title">获取方法（点击链接将在新标签页打开阿里云官方页面）</div><ol><li><b>AccessKey：</b>进入 <a href="https://ram.console.aliyun.com/users" target="_blank" rel="noopener noreferrer">RAM 用户控制台</a>，创建专用 RAM 用户并生成 AccessKey；Secret 只显示一次，请立即保存。随后在“权限管理 → 权限策略”创建自定义策略，并将策略授权给该用户。查看 <a href="https://help.aliyun.com/zh/ram/user-guide/accesskey-pair-management/" target="_blank" rel="noopener noreferrer">创建 AccessKey</a>、<a href="https://help.aliyun.com/zh/ram/create-a-custom-policy" target="_blank" rel="noopener noreferrer">创建自定义策略</a>和<a href="https://help.aliyun.com/zh/ram/user-guide/grant-permissions-to-the-ram-user" target="_blank" rel="noopener noreferrer">为用户授权</a>。<div class="permission-box"><b>本控制器建议的最小权限</b><ul class="permission-list"><li>ecs:RunInstances</li><li>ecs:DescribeInstances</li><li>ecs:DeleteInstances</li><li>ecs:CreateLaunchTemplate</li><li>ecs:DescribeLaunchTemplates</li><li>ecs:DescribeLaunchTemplateVersions</li><li>ecs:DescribeImages</li><li>ecs:DescribeSecurityGroups</li><li>ecs:CreateSecurityGroup</li><li>ecs:DeleteSecurityGroup（可选）</li><li>ecs:DescribeKeyPairs</li><li>ecs:DescribeTags</li><li>vpc:DescribeVpcs</li><li>vpc:DescribeVSwitches</li><li>ecs:DescribeInstanceHistoryEvents</li><li>bssapi:QueryAccountBalance</li><li>bssapi:QueryBillOverview</li></ul><span class="warning">BSS 两项只读权限用于余额与账单展示；最后一项 ECS 权限用于查询创建失败和系统事件，若只依赖 DescribeInstances 的 Recycling 锁可暂不授予。若启动模板引用实例 RAM 角色，还需 ram:PassRole。</span><details><summary>展开可复制的 RAM Policy JSON</summary><pre>{
   &quot;Version&quot;: &quot;1&quot;,
   &quot;Statement&quot;: [{
     &quot;Effect&quot;: &quot;Allow&quot;,
@@ -126,10 +137,8 @@ HTML = r'''<!doctype html>
   }]
 }</pre></details></div></li><li><b>Region ID：</b>地域通常形如 <span class="mono">cn-hangzhou</span>，可在 ECS 控制台当前地域或 <a href="https://help.aliyun.com/zh/ecs/api-regions-describeregions" target="_blank" rel="noopener noreferrer">地域列表说明</a>中确认。</li><li><b>启动模板 ID / 版本：</b>进入 <a href="https://ecs.console.aliyun.com/" target="_blank" rel="noopener noreferrer">ECS 控制台</a>，切换到相同地域，在“部署与弹性 → 实例启动模板”中创建或复制模板 ID、版本号。查看 <a href="https://help.aliyun.com/zh/ecs/user-guide/launch-templates/" target="_blank" rel="noopener noreferrer">启动模板说明</a>。</li><li><b>资源组 ID：</b>可选。进入 <a href="https://resourcemanager.console.aliyun.com/resource-group" target="_blank" rel="noopener noreferrer">资源组控制台</a>复制 <span class="mono">rg-...</span>；不使用资源组可留空。</li></ol><div class="warning">安全提示：请使用最小权限 RAM 子账号，不要使用主账号 AccessKey，也不要通过聊天或截图发送 Secret。</div></div></div><div class="dialog-actions"><button id="cancelSettings" type="button">取消</button><button id="saveSettings" class="primary" type="submit">保存</button></div></form></dialog>
 <dialog id="deleteDialog"><form id="deleteForm"><div class="dialog-head">确认删除节点</div><div class="settings-form"><div class="settings-note">此操作将先从代理池下线节点，再永久释放阿里云 ECS 实例，无法撤销。</div><label>实例 ID</label><strong id="deleteInstanceId" class="mono"></strong></div><div class="dialog-actions"><button id="cancelDelete" type="button">取消</button><button id="confirmDelete" class="danger" type="submit">删除并释放</button></div></form></dialog>
-<dialog id="securityGroupDialog"><form id="securityGroupForm"><div class="dialog-head">创建普通 VPC 安全组</div><div class="settings-form"><label for="securityGroupName">安全组名称</label><input id="securityGroupName" maxlength="128" pattern="[A-Za-z][A-Za-z0-9._-]{2,127}" required><label for="securityGroupDescription">描述</label><input id="securityGroupDescription" maxlength="256" pattern="[A-Za-z0-9 .,_:/()\-]{1,256}" required><label for="securityGroupVSwitchId">目标交换机</label><select id="securityGroupVSwitchId" required></select><div class="settings-note">仅创建目标交换机所属 VPC 的普通安全组，不创建任何公网入站规则。名称和描述必须唯一且仅允许白名单字符。</div></div><div class="dialog-actions"><button id="cancelSecurityGroup" type="button">取消</button><button id="createSecurityGroup" class="primary" type="submit">创建</button></div></form></dialog>
-<dialog id="templateDialog"><form id="templateForm"><div class="dialog-head">创建阿里云启动模板</div><div class="settings-form"><label for="templateName">模板名称</label><input id="templateName" maxlength="128" required><label for="templateDescription">描述（可选）</label><input id="templateDescription" maxlength="256"><label for="imageId">镜像</label><select id="imageId" required></select><label for="instanceType">实例规格</label><select id="instanceType" required></select><label for="vSwitchId">交换机</label><select id="vSwitchId" required></select><label for="securityGroupId">安全组</label><select id="securityGroupId" required></select><div class="settings-note">请先保存 AccessKey、地域及 SOCKS 凭据。模板将通过 Ubuntu cloud-init 安装并配置 Dante，同时为所选安全组开放公网 TCP 1080。创建成功后会自动回填模板 ID 和版本。</div></div><div class="dialog-actions"><button id="cancelTemplate" type="button">取消</button><button id="createTemplate" class="primary" type="submit">创建</button></div></form></dialog>
 <dialog id="proxyTestDialog"><form id="proxyTestForm"><div class="dialog-head">代理测试</div><div class="settings-form"><label for="testInstanceId">节点实例 ID</label><select id="testInstanceId" required><option value="">请选择节点</option></select><label for="testTargetUrl">目标 URL</label><input id="testTargetUrl" type="url" maxlength="512" placeholder="https://httpbin.org/ip" required value="https://httpbin.org/ip"><div id="testResult" style="grid-column:1/-1;min-height:60px;max-height:200px;overflow:auto;padding:8px;background:#f2f4f6;border:1px solid #d8dde2;font-size:12px;font-family:Consolas,monospace;white-space:pre-wrap">等待测试</div><div class="settings-note">通过指定节点的 SOCKS5 代理向目标 URL 发起 HTTP GET 请求，返回状态码、延迟和响应大小。</div></div><div class="dialog-actions"><button id="cancelProxyTest" type="button">取消</button><button id="runProxyTest" class="primary" type="submit">执行测试</button></div></form></dialog>
-<dialog id="balancedDialog"><form id="balancedForm"><div class="dialog-head">负载均衡获取代理</div><div class="settings-form"><label for="lbStrategy">调度策略</label><select id="lbStrategy"><option value="round-robin" selected>轮询 (round-robin)</option><option value="random">随机 (random)</option><option value="least-connections">最少连接 (least-connections)</option><option value="lowest-latency">最低延迟 (lowest-latency)</option></select><div id="lbResult" style="grid-column:1/-1;min-height:40px;padding:8px;background:#f2f4f6;border:1px solid #d8dde2;font-size:12px;font-family:Consolas,monospace;word-break:break-all">尚未获取</div><div class="settings-note">按所选策略从代理池中分配一个代理地址。需配置 API Token。</div></div><div class="dialog-actions"><button id="cancelBalanced" type="button">取消</button><button id="getBalanced" class="primary" type="submit">获取代理</button></div></form></dialog>
+<dialog id="balancedDialog"><form id="balancedForm"><div class="dialog-head">负载均衡获取代理</div><div class="settings-form"><label for="lbStrategy">调度策略</label><select id="lbStrategy"><option value="round-robin" selected>轮询 (round-robin)</option><option value="random">随机 (random)</option><option value="least-connections">最少连接 (least-connections)</option><option value="lowest-latency">最低延迟 (lowest-latency)</option></select><div id="lbResult" style="grid-column:1/-1;min-height:40px;padding:8px;background:#f2f4f6;border:1px solid #d8dde2;font-size:12px;font-family:Consolas,monospace;white-space:pre-wrap;word-break:break-all">尚未获取</div><div class="settings-note">按所选策略从代理池中分配一个代理地址。需配置 API Token。</div></div><div class="dialog-actions"><button id="cancelBalanced" type="button">取消</button><button id="getBalanced" class="primary" type="submit">获取代理</button></div></form></dialog>
 <script>
 const $ = id => document.getElementById(id);
 let timer = null;
@@ -139,21 +148,20 @@ const esc=s=>String(s??'—').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>'
 const labels={healthy:'健康',pending:'启动中',draining:'回收中',error:'错误'};
 function toast(msg,bad=false){const e=$('toast');e.textContent=msg;e.className='toast show'+(bad?' bad':'');clearTimeout(e._t);e._t=setTimeout(()=>e.className='toast',2600)}
 function render(d){$('reconcile').disabled=!d.reconcile_enabled;$('healthy').textContent=d.stats.healthy;$('pending').textContent=d.stats.pending;$('draining').textContent=d.stats.draining;$('errors').textContent=d.stats.errors;$('aliyunState').textContent=d.aliyun_configured?'已配置':'未配置';$('runtime').textContent=d.runtime.running?'调和执行中':(d.runtime.ok?'运行正常':'需要关注');$('runtimeNote').textContent=(d.runtime.last_reconcile?'上次调和 '+new Date(d.runtime.last_reconcile).toLocaleTimeString():'等待首次调和')+(d.runtime.auto_reconcile_interval>0?(d.runtime.next_auto_reconcile?' · 下次 '+new Date(d.runtime.next_auto_reconcile).toLocaleTimeString():' · 自动调和已启用'):'');$('led').className='led '+(d.runtime.running?'busy':(d.runtime.ok?'':'error'));if(document.activeElement!==$('target'))$('target').value=d.target;lastTarget=d.target;$('adapter').textContent=d.adapter;$('pool').textContent=d.pool;$('updated').textContent='更新于 '+new Date(d.generated_at).toLocaleTimeString();$('nodeCount').textContent=d.nodes.length+' 个节点';
-$('nodes').innerHTML=d.nodes.length?d.nodes.map(n=>{const lat=n.latency_ms?n.latency_ms.toFixed(0)+'ms':'—';const geo=n.geo?`${esc(n.geo.country)} ${esc(n.geo.city||'')}`:'—';const fc=n.failure_count||0;return `<tr><td><span class="badge ${esc(n.state)}">${esc(labels[n.state]||n.state)}</span></td><td class="mono">${esc(n.instance_id)}</td><td class="mono">${esc(n.public_ip)}</td><td>${esc(n.cloud_status)}</td><td>${esc(n.zone)}</td><td class="mono">${lat}</td><td>${geo}</td><td>${fc>0?`<span class="red">${fc}</span>`:'0'}</td><td>${esc(new Date(n.created_at).toLocaleString())}</td><td><button class="node-delete" data-instance-id="${esc(n.instance_id)}" ${d.runtime.running?'disabled':''}>删除</button></td></tr>`}).join(''):'<tr><td class="empty" colspan="10">暂无节点</td></tr>';
+const checkedIds=new Set(selectedNodes().map(x=>x.id));$('nodes').innerHTML=d.nodes.length?d.nodes.map(n=>{const lat=n.latency_ms?n.latency_ms.toFixed(0)+'ms':'—';const geo=n.geo?`${esc(n.geo.country)} ${esc(n.geo.city||'')}`:'—';const fc=n.failure_count||0;return `<tr><td><input class="node-select" type="checkbox" data-instance-id="${esc(n.instance_id)}" data-state="${esc(n.state)}" ${checkedIds.has(n.instance_id)?'checked':''}></td><td><span class="badge ${esc(n.state)}">${esc(labels[n.state]||n.state)}</span></td><td class="mono">${esc(n.instance_id)}</td><td class="mono">${esc(n.public_ip)}</td><td>${esc(n.cloud_status)}</td><td>${esc(n.zone)}</td><td class="mono">${lat}</td><td>${geo}</td><td>${fc>0?`<span class="red">${fc}</span>`:'0'}</td><td>${esc(new Date(n.created_at).toLocaleString())}</td><td><button class="node-delete" data-instance-id="${esc(n.instance_id)}" ${d.runtime.running?'disabled':''}>删除</button></td></tr>`}).join(''):'<tr><td class="empty" colspan="11">暂无节点</td></tr>';$('selectAllNodes').checked=false;updateBatchButtons();
 $('candidates').innerHTML=d.candidates.map(c=>`<div class="candidate"><div class="candidate-top"><span class="candidate-name">${esc(c.zone)}</span><span class="stock">${esc(c.availability)}</span></div><div class="candidate-meta">${esc(c.region_id)} · ${esc(c.instance_type)}<br>${esc(c.vswitch_id)}</div></div>`).join('');$('events').innerHTML=d.events.length?d.events.map(e=>`<div class="event"><time>${esc(new Date(e.time).toLocaleString())}</time>${esc(e.message)}</div>`).join(''):'<div class="event">暂无操作记录</div>'}
 async function api(path,opt){const c=new AbortController;const t=setTimeout(()=>c.abort(),60000);try{const tok=localStorage.getItem('pp_token')||'';const hdrs=Object.assign({},(opt&&opt.headers)||{});if(tok)hdrs['Authorization']='Bearer '+tok;const r=await fetch(path,{...opt,headers:hdrs,signal:c.signal});const d=await r.json().catch(()=>({error:'响应格式错误'}));if(!r.ok)throw Error(d.error||`HTTP ${r.status}`);return d}catch(e){if(e.name==='AbortError')throw Error('请求超时');throw e}finally{clearTimeout(t)}}
 function renderBilling(d){$('billAvailableCash').textContent=d.available_cash_amount??'—';$('billBalance').textContent=d.balance??'—';$('billSpent').textContent=d.month_spent??'—';$('billCredit').textContent=d.credit_amount??'—';$('billCurrency').textContent=d.currency??'—';$('billCycle').textContent=d.billing_cycle??'—';$('billUpdated').textContent=d.updated_at?new Date(d.updated_at).toLocaleTimeString():'—';const bankCredit=d.mybank_credit_amount!=null?`网商银行信控 ${d.mybank_credit_amount}；`:'';$('billStatus').textContent=bankCredit+d.message+'；可用额度不等于 ECS 下单门槛，按量实例可能要求可用额度不少于 100 元；账单非实时，以费用中心出账为准'}
 async function refreshBilling(){try{renderBilling(await api('/api/billing'))}catch(e){$('billStatus').textContent='账单状态读取失败；账单非实时，以费用中心出账为准'}}
 async function refresh(silent=true){if(loading)return;loading=true;try{render(await api('/api/status'))}catch(e){$('runtime').textContent='连接失败';$('runtimeNote').textContent=e.message;$('led').className='led error';if(!silent)toast(e.message,true)}finally{loading=false}}
 async function action(path,body,msg){try{const d=await api(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});render(d);toast(msg)}catch(e){toast(e.message,true)}finally{setBusy(false)}}
-function setBusy(v){$('reconcile').disabled=v;$('saveTarget').disabled=v}
-$('nodes').onclick=e=>{const button=e.target.closest('.node-delete');if(!button)return;$('deleteInstanceId').textContent=button.dataset.instanceId;$('deleteDialog').showModal()};$('cancelDelete').onclick=()=>$('deleteDialog').close();$('deleteDialog').onclick=e=>{if(e.target===$('deleteDialog'))$('deleteDialog').close()};$('deleteForm').onsubmit=async e=>{e.preventDefault();const instanceId=$('deleteInstanceId').textContent;try{$('confirmDelete').disabled=true;const d=await api('/api/nodes/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({instance_id:instanceId})});$('deleteDialog').close();render(d);toast(`节点 ${instanceId} 已删除`)}catch(e){toast(e.message,true)}finally{$('confirmDelete').disabled=false}};
-function toggleSpotDuration(){const isSpot=$('instanceChargeType').value==='Spot';$('spotDuration').disabled=!isSpot;const op=isSpot?'1':'0.5';$('spotDuration').style.opacity=op;const lbl=document.querySelector('label[for="spotDuration"]');if(lbl)lbl.style.opacity=op}$('instanceChargeType').onchange=toggleSpotDuration;async function openSettings(){try{const d=await api('/api/settings');$('akId').value='';$('akId').placeholder=d.access_key_id_configured?'AccessKey ID 已配置；输入可替换':'输入 AccessKey ID';$('akSecret').value='';$('akSecret').disabled=false;$('secretState').textContent=d.secret_configured?'密钥已配置':'密钥未配置';$('socksUsername').value=d.socks5_username;$('socksPassword').value='';$('socksPasswordState').textContent=d.socks5_password_configured?'密码已配置':'密码未配置';$('proxyApiToken').value='';$('proxyApiTokenState').textContent=d.proxy_api_bearer_token_configured?'Token 已配置':'Token 未配置';const region=$('regionId');region.querySelector('option[data-current]')?.remove();if(d.region_id&&!Array.from(region.options).some(o=>o.value===d.region_id)){const option=new Option(`当前值 · ${d.region_id}`,d.region_id);option.dataset.current='';region.add(option)}region.value=d.region_id;const template=$('templateId');template.replaceChildren(new Option('请选择启动模板',''));[['lt-bp10ty3f6hvurdiyxn6u','1']].forEach(([id,v])=>{const o=new Option(`内置模板 · ${id}`,id);o.dataset.version=v;template.add(o)});if(d.access_key_id_configured&&d.secret_configured&&d.region_id){try{const resources=await api('/api/resources');resources.launch_templates.forEach(x=>{if(!Array.from(template.options).some(o=>o.value===x.id)){const o=new Option(`${x.name} · ${x.id}`,x.id);o.dataset.version=x.version;template.add(o)}})}catch(e){}}if(d.launch_template_id&&!Array.from(template.options).some(o=>o.value===d.launch_template_id))template.add(new Option(`当前值 · ${d.launch_template_id}`,d.launch_template_id));template.value=d.launch_template_id;$('templateVersion').value=d.launch_template_version;$('resourceGroupId').value=d.resource_group_id;const pn=$('poolName');pn.innerHTML=['proxy-main','proxy-backup','proxy-secondary','proxy-test'].map(n=>`<option value="${n}">${n}</option>`).join('');if(d.pool_name&&!Array.from(pn.options).some(o=>o.value===d.pool_name))pn.add(new Option(`当前值 · ${d.pool_name}`,d.pool_name));pn.value=d.pool_name;$('clearSecret').checked=false;$('batchSize').value=d.batch_size||'';$('pendingTimeout').value=d.pending_timeout_minutes||'';$('autoReconcileInterval').value=d.auto_reconcile_interval||'';$('circuitBreakerThreshold').value=d.circuit_breaker_threshold||'';$('instanceChargeType').value=d.instance_charge_type||'PostPaid';$('spotDuration').value=d.spot_duration||'0';toggleSpotDuration();$('settingsDialog').showModal()}catch(e){toast(e.message,true)}}
-$('openSettings').onclick=openSettings;$('templateId').onchange=()=>{const version=$('templateId').selectedOptions[0]?.dataset.version;if(version)$('templateVersion').value=version};$('cancelSettings').onclick=()=>$('settingsDialog').close();$('settingsDialog').onclick=e=>{if(e.target===$('settingsDialog'))$('settingsDialog').close()};$('clearSecret').onchange=()=>{$('akSecret').disabled=$('clearSecret').checked;if($('clearSecret').checked)$('akSecret').value=''};$('akSecret').oninput=()=>{if($('akSecret').value)$('clearSecret').checked=false};$('settingsForm').onsubmit=async e=>{e.preventDefault();const body={region_id:$('regionId').value,launch_template_id:$('templateId').value,launch_template_version:$('templateVersion').value,resource_group_id:$('resourceGroupId').value,pool_name:$('poolName').value,access_key_secret:$('akSecret').value,socks5_username:$('socksUsername').value,socks5_password:$('socksPassword').value,proxy_api_bearer_token:$('proxyApiToken').value,clear_secret:$('clearSecret').checked,batch_size:$('batchSize').value,pending_timeout_minutes:$('pendingTimeout').value,auto_reconcile_interval:$('autoReconcileInterval').value,circuit_breaker_threshold:$('circuitBreakerThreshold').value,instance_charge_type:$('instanceChargeType').value,spot_duration:$('spotDuration').value};if($('akId').value)body.access_key_id=$('akId').value;try{$('saveSettings').disabled=true;await api('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});$('settingsDialog').close();toast('阿里云设置已保存');refresh(true)}catch(e){toast(e.message,true)}finally{$('saveSettings').disabled=false}};
-const fillSelect=(id,items)=>{$(id).innerHTML=items.map(x=>`<option value="${esc(x.id)}">${esc(x.name)}</option>`).join('')};$('openSecurityGroup').onclick=async()=>{try{const r=await api('/api/resources');fillSelect('securityGroupVSwitchId',r.vswitches);$('securityGroupDialog').showModal()}catch(e){toast(e.message,true)}};$('cancelSecurityGroup').onclick=()=>$('securityGroupDialog').close();$('securityGroupDialog').onclick=e=>{if(e.target===$('securityGroupDialog'))$('securityGroupDialog').close()};$('securityGroupForm').onsubmit=async e=>{e.preventDefault();const body={security_group_name:$('securityGroupName').value,description:$('securityGroupDescription').value,v_switch_id:$('securityGroupVSwitchId').value};try{$('createSecurityGroup').disabled=true;const d=await api('/api/security-groups',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});$('securityGroupDialog').close();$('securityGroupForm').reset();toast(`安全组 ${d.security_group_id} 已创建`);await api('/api/resources')}catch(e){toast(e.message,true)}finally{$('createSecurityGroup').disabled=false}};$('openTemplate').onclick=async()=>{try{const r=await api('/api/resources');fillSelect('imageId',r.images);fillSelect('instanceType',r.instance_types);fillSelect('vSwitchId',r.vswitches);fillSelect('securityGroupId',r.security_groups);$('templateDialog').showModal()}catch(e){toast(e.message,true)}};$('cancelTemplate').onclick=()=>$('templateDialog').close();$('templateDialog').onclick=e=>{if(e.target===$('templateDialog'))$('templateDialog').close()};$('templateForm').onsubmit=async e=>{e.preventDefault();const body={launch_template_name:$('templateName').value,description:$('templateDescription').value,image_id:$('imageId').value,instance_type:$('instanceType').value,v_switch_id:$('vSwitchId').value,security_group_id:$('securityGroupId').value};try{$('createTemplate').disabled=true;const d=await api('/api/launch-templates',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});$('templateDialog').close();$('templateForm').reset();toast(`启动模板 ${d.launch_template_id} 已创建`);refresh(true)}catch(e){toast(e.message,true)}finally{$('createTemplate').disabled=false}};
-$('openProxyTest').onclick=async()=>{try{const d=await api('/api/status');const sel=$('testInstanceId');sel.innerHTML='<option value="">请选择节点</option>';d.nodes.filter(n=>n.state==='healthy').forEach(n=>sel.add(new Option(`${n.instance_id} (${n.public_ip})`,n.instance_id)));$('testResult').textContent='等待测试';$('proxyTestDialog').showModal()}catch(e){toast(e.message,true)}};$('cancelProxyTest').onclick=()=>$('proxyTestDialog').close();$('proxyTestDialog').onclick=e=>{if(e.target===$('proxyTestDialog'))$('proxyTestDialog').close()};$('proxyTestForm').onsubmit=async e=>{e.preventDefault();const body={instance_id:$('testInstanceId').value,target_url:$('testTargetUrl').value};if(!body.instance_id){toast('请选择节点',true);return}try{$('runProxyTest').disabled=true;$('testResult').textContent='测试中...';const d=await api('/api/proxy-test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});$('testResult').textContent=JSON.stringify(d,null,2)}catch(e){$('testResult').textContent='错误：'+e.message}finally{$('runProxyTest').disabled=false}};
-$('openBalanced').onclick=()=>{$('lbResult').textContent='尚未获取';$('balancedDialog').showModal()};$('cancelBalanced').onclick=()=>$('balancedDialog').close();$('balancedDialog').onclick=e=>{if(e.target===$('balancedDialog'))$('balancedDialog').close()};$('balancedForm').onsubmit=async e=>{e.preventDefault();const strategy=$('lbStrategy').value;try{$('getBalanced').disabled=true;const d=await api('/api/proxies/balanced',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({strategy})});$('lbResult').textContent=d.proxy||'无可用代理'}catch(e){$('lbResult').textContent='错误：'+e.message}finally{$('getBalanced').disabled=false}};
-$('saveTarget').onclick=()=>{const v=Number($('target').value);if(!Number.isInteger(v)||v<0||v>1000)return toast('目标节点数需为 0–1000 的整数',true);setBusy(true);action('/api/target',{target:v},'目标节点数已更新')};$('reconcile').onclick=()=>{setBusy(true);action('/api/reconcile',{},'调和已完成')};$('refresh').onclick=()=>{refresh(false);refreshBilling()};$('auto').onchange=schedule;$('interval').onchange=schedule;function schedule(){clearInterval(timer);if($('auto').checked)timer=setInterval(()=>refresh(true),Number($('interval').value)*1000)}document.addEventListener('keydown',e=>{if(e.key==='F5'){e.preventDefault();refresh(false);refreshBilling()}if(e.ctrlKey&&e.key==='Enter')$('reconcile').click()});$('saveToken').onclick=()=>{const v=$('tokenInput').value.trim();if(v){localStorage.setItem('pp_token',v);$('tokenInput').value='';$('tokenInput').placeholder='Token 已保存 ✓';toast('Token 已保存，写操作已解锁')}else{localStorage.removeItem('pp_token');$('tokenInput').placeholder='API Token（远程操作需填写）';toast('Token 已清除')}};(function(){const t=localStorage.getItem('pp_token');if(t)$('tokenInput').placeholder='Token 已保存 ✓'})();refresh(false);refreshBilling();schedule();
+function setBusy(v){$('reconcile').disabled=v}
+function selectedNodes(){return [...document.querySelectorAll('.node-select:checked')].map(e=>({id:e.dataset.instanceId,state:e.dataset.state}))}function updateBatchButtons(){const items=selectedNodes();$('batchTest').disabled=!items.length;$('batchDelete').disabled=!items.length;$('selectAllNodes').checked=!!document.querySelectorAll('.node-select').length&&items.length===document.querySelectorAll('.node-select').length}function openBatchTest(){const items=selectedNodes();if(!items.length)return;const healthy=items.filter(x=>x.state==='healthy');$('testInstanceId').replaceChildren(new Option('请选择节点',''));healthy.forEach(x=>$('testInstanceId').add(new Option(x.id,x.id)));$('testResult').textContent=healthy.length?`已选 ${items.length} 个节点，可测试 ${healthy.length} 个健康节点`:'选中的节点没有健康节点';$('proxyTestDialog').showModal()}$('selectAllNodes').onchange=()=>{document.querySelectorAll('.node-select').forEach(e=>e.checked=$('selectAllNodes').checked);updateBatchButtons()};$('nodes').onchange=e=>{if(e.target.classList.contains('node-select'))updateBatchButtons()};$('batchTest').onclick=openBatchTest;$('batchDelete').onclick=()=>{const ids=selectedNodes().map(x=>x.id);if(!ids.length)return;$('deleteInstanceId').textContent=`已选 ${ids.length} 个节点`;$('deleteDialog').dataset.batchIds=JSON.stringify(ids);$('deleteDialog').showModal()};$('nodes').onclick=e=>{const button=e.target.closest('.node-delete');if(!button)return;$('deleteInstanceId').textContent=button.dataset.instanceId;$('deleteDialog').dataset.batchIds='';$('deleteDialog').showModal()};$('cancelDelete').onclick=()=>$('deleteDialog').close();$('deleteDialog').onclick=e=>{if(e.target===$('deleteDialog'))$('deleteDialog').close()};$('deleteForm').onsubmit=async e=>{e.preventDefault();const ids=JSON.parse($('deleteDialog').dataset.batchIds||'[]');const instanceIds=ids.length?ids:[$('deleteInstanceId').textContent];try{$('confirmDelete').disabled=true;for(const instanceId of instanceIds){await api('/api/nodes/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({instance_id:instanceId})})}$('deleteDialog').close();$('selectAllNodes').checked=false;refresh(false);toast(`${instanceIds.length} 个节点已删除`)}catch(e){toast(e.message,true)}finally{$('confirmDelete').disabled=false}};
+function proxyUrl(item){if(!item)return '';if(typeof item==='string')return item;return item.proxy_whitelist||item.proxy||''}function renderProxyResult(item){if(!item)return '无可用代理';if(typeof item==='string')return item;const url=proxyUrl(item)||'—';return [`代理：${url}`,`出口 IP：${item.exit_ip||'—'}`,`类型：${item.family||'—'}`,`节点：${item.instance_id||item.server_ip||'—'}`].join('\n')}function toggleSpotDuration(){const isSpot=$('instanceChargeType').value==='Spot';$('spotDuration').disabled=!isSpot;const op=isSpot?'1':'0.5';$('spotDuration').style.opacity=op;const lbl=document.querySelector('label[for="spotDuration"]');if(lbl)lbl.style.opacity=op}$('instanceChargeType').onchange=toggleSpotDuration;function selectedTemplateMode(){return $('templateId').selectedOptions[0]?.dataset.mode||'socks5'}function toggleMode(){const mode=selectedTemplateMode();document.querySelectorAll('.mode-only').forEach(e=>e.classList.toggle('hidden-mode',e.dataset.mode!==mode));const warp=mode==='warpgate';$('templateModeHint').innerHTML=warp?'<strong>ProxyPilot-WarpGate</strong>：每台 ECS 自动运行多个出口，可按 IPv4、IPv6 或双栈提取；API 端口仅允许白名单访问。':'<strong>ProxyPilot-Dante</strong>：每台 ECS 提供一个带账号密码的 SOCKS5 单出口。';$('warpgateWhitelistIp').required=warp;$('lbStrategy').innerHTML=warp?'<option value="round-robin">轮询 (round-robin)</option><option value="random">随机 (random)</option>':'<option value="round-robin">轮询 (round-robin)</option><option value="random">随机 (random)</option><option value="least-connections">最少连接 (least-connections)</option><option value="lowest-latency">最低延迟 (lowest-latency)</option>'}async function openSettings(){try{const d=await api('/api/settings');$('akId').value='';$('akId').placeholder=d.access_key_id_configured?'AccessKey ID 已配置；输入可替换':'输入 AccessKey ID';$('akSecret').value='';$('akSecret').disabled=false;$('secretState').textContent=d.secret_configured?'密钥已配置':'密钥未配置';$('socksUsername').value=d.socks5_username;$('socksPassword').value='';$('socksPasswordState').textContent=d.socks5_password_configured?'密码已配置':'密码未配置';$('proxyApiToken').value='';$('proxyApiTokenState').textContent=d.proxy_api_bearer_token_configured?'Token 已配置':'Token 未配置';const region=$('regionId');region.querySelector('option[data-current]')?.remove();if(d.region_id&&!Array.from(region.options).some(o=>o.value===d.region_id)){const option=new Option(`当前值 · ${d.region_id}`,d.region_id);option.dataset.current='';region.add(option)}region.value=d.region_id;const template=$('templateId');template.replaceChildren(new Option('请选择启动模板',''));[["builtin-dante","ProxyPilot-Dante","socks5"],["builtin-warpgate","ProxyPilot-WarpGate","warpgate"]].forEach(([id,name,mode])=>{const o=new Option(name,id);o.dataset.mode=mode;o.dataset.version='1';template.add(o)});template.value=d.proxy_mode==='warpgate'?'builtin-warpgate':'builtin-dante';$('templateVersion').value=d.launch_template_version;$('resourceGroupId').value=d.resource_group_id;const pn=$('poolName');pn.innerHTML=['proxy-main','proxy-backup','proxy-secondary','proxy-test'].map(n=>`<option value="${n}">${n}</option>`).join('');if(d.pool_name&&!Array.from(pn.options).some(o=>o.value===d.pool_name))pn.add(new Option(`当前值 · ${d.pool_name}`,d.pool_name));pn.value=d.pool_name;$('clearSecret').checked=false;$('batchSize').value=d.batch_size||'';$('pendingTimeout').value=d.pending_timeout_minutes||'';$('autoReconcileInterval').value=d.auto_reconcile_interval||'';$('circuitBreakerThreshold').value=d.circuit_breaker_threshold||'';$('warpgateApiPort').value=d.warpgate_api_port||'4433';$('warpgateInstances').value=d.warpgate_instances||'20';$('warpgateIpFamily').value=d.warpgate_ip_family||'both';$('warpgateWhitelistIp').value=d.warpgate_whitelist_ip||'';$('instanceChargeType').value=d.instance_charge_type||'PostPaid';$('spotDuration').value=d.spot_duration||'0';toggleSpotDuration();toggleMode();$('settingsDialog').showModal()}catch(e){toast(e.message,true)}}
+$('openSettings').onclick=openSettings;$('templateId').onchange=()=>{const version=$('templateId').selectedOptions[0]?.dataset.version;if(version)$('templateVersion').value=version;toggleMode()};$('cancelSettings').onclick=()=>$('settingsDialog').close();$('settingsDialog').onclick=e=>{if(e.target===$('settingsDialog'))$('settingsDialog').close()};$('clearSecret').onchange=()=>{$('akSecret').disabled=$('clearSecret').checked;if($('clearSecret').checked)$('akSecret').value=''};$('akSecret').oninput=()=>{if($('akSecret').value)$('clearSecret').checked=false};$('settingsForm').onsubmit=async e=>{e.preventDefault();const body={region_id:$('regionId').value,launch_template_id:$('templateId').value,launch_template_version:$('templateVersion').value,resource_group_id:$('resourceGroupId').value,pool_name:$('poolName').value,proxy_mode:selectedTemplateMode(),warpgate_api_port:$('warpgateApiPort').value,warpgate_instances:$('warpgateInstances').value,warpgate_ip_family:$('warpgateIpFamily').value,warpgate_whitelist_ip:$('warpgateWhitelistIp').value,access_key_secret:$('akSecret').value,socks5_username:$('socksUsername').value,socks5_password:$('socksPassword').value,proxy_api_bearer_token:$('proxyApiToken').value,clear_secret:$('clearSecret').checked,batch_size:$('batchSize').value,pending_timeout_minutes:$('pendingTimeout').value,auto_reconcile_interval:$('autoReconcileInterval').value,circuit_breaker_threshold:$('circuitBreakerThreshold').value,instance_charge_type:$('instanceChargeType').value,spot_duration:$('spotDuration').value};if($('akId').value)body.access_key_id=$('akId').value;try{$('saveSettings').disabled=true;await api('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});$('settingsDialog').close();toast('阿里云设置已保存');refresh(true)}catch(e){toast(e.message,true)}finally{$('saveSettings').disabled=false}};
+$('cancelProxyTest').onclick=()=>$('proxyTestDialog').close();$('proxyTestDialog').onclick=e=>{if(e.target===$('proxyTestDialog'))$('proxyTestDialog').close()};$('proxyTestForm').onsubmit=async e=>{e.preventDefault();const ids=[...$('testInstanceId').options].filter(o=>o.value).map(o=>o.value);const targetUrl=$('testTargetUrl').value;if(!ids.length){toast('选中的节点没有健康节点',true);return}try{$('runProxyTest').disabled=true;const results=[];for(const instanceId of ids){$('testResult').textContent=`正在测试 ${instanceId}...`;try{const d=await api('/api/proxy-test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({instance_id:instanceId,target_url:targetUrl})});results.push(`${instanceId}\n${JSON.stringify(d,null,2)}`)}catch(e){results.push(`${instanceId}\n错误：${e.message}`)}}$('testResult').textContent=results.join('\n\n')}finally{$('runProxyTest').disabled=false}};
+$('openBalanced').onclick=()=>{$('lbResult').textContent='尚未获取';$('balancedDialog').showModal()};$('cancelBalanced').onclick=()=>$('balancedDialog').close();$('balancedDialog').onclick=e=>{if(e.target===$('balancedDialog'))$('balancedDialog').close()};$('balancedForm').onsubmit=async e=>{e.preventDefault();const strategy=$('lbStrategy').value;try{$('getBalanced').disabled=true;const d=await api('/api/proxies/balanced',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({strategy})});$('lbResult').textContent=renderProxyResult(d.proxy)}catch(e){$('lbResult').textContent='错误：'+e.message}finally{$('getBalanced').disabled=false}};
+$('reconcile').onclick=()=>{const v=Number($('target').value);if(!Number.isInteger(v)||v<0||v>1000)return toast('目标节点数需为 0–1000 的整数',true);setBusy(true);action('/api/target',{target:v},'调和已完成')};$('logout').onclick=()=>{localStorage.removeItem('pp_token');$('appShell').style.display='none';$('loginScreen').style.display='flex';$('loginKey').value='';$('loginKey').focus()};$('loginForm').onsubmit=async e=>{e.preventDefault();const key=$('loginKey').value.trim();if(!key)return;try{await api('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key})});localStorage.setItem('pp_token',key);$('loginScreen').style.display='none';$('appShell').style.display='block';refresh(false);refreshBilling()}catch(e){$('loginError').textContent='登录 Key 不正确'}};(async()=>{const key=localStorage.getItem('pp_token');if(!key){$('loginKey').focus();return}try{await api('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key})});$('loginScreen').style.display='none';$('appShell').style.display='block';refresh(false);refreshBilling()}catch(e){localStorage.removeItem('pp_token');$('loginKey').focus()}})();document.addEventListener('keydown',e=>{if(e.key==='F5'){e.preventDefault();refresh(false);refreshBilling()}if(e.ctrlKey&&e.key==='Enter')$('reconcile').click()});refreshBilling();setInterval(()=>{if($('appShell').style.display!=='none'){refresh(true);refreshBilling()}},5000);
 </script></body></html>'''
 
 
@@ -168,7 +176,7 @@ HELP_HTML = r'''<!doctype html>
 </head>
 <body><header><strong>节点调和控制台</strong><a href="/">返回控制台</a></header><main class="page">
 <section class="intro"><h1>使用说明</h1><p>用于配置阿里云 ECS 节点、创建 Dante SOCKS5 启动模板，并安全地调和代理池规模。</p><nav aria-label="帮助目录"><a href="#configuration">配置</a><a href="#buttons">按钮说明</a><a href="#dante">Dante 模板</a><a href="#scaling">扩缩容</a><a href="#extract-socks">提取代理</a><a href="#proxy-test">代理测试</a><a href="#delete">删除</a><a href="#cost-security">费用与安全</a><a href="#troubleshooting">故障排查</a><a href="#spot-tutorial">抢占式教程</a><a href="#cost-tutorial">费用教程</a><a href="#api-control">API 控制</a><a href="#ai-prompt">AI 提示词模板</a></nav></section>
-<section class="section" id="configuration"><h2>1. 配置</h2><ol><li>在“阿里云设置”中填写专用 RAM 用户的 AccessKey、地域、启动模板、实例标签池名称；资源组和模板版本可选。</li><li>填写 SOCKS 用户名、密码和代理 API Token。秘密字段留空会保留原值；只有勾选“清除现有密钥”才会清除 AccessKey Secret。</li><li>也可通过同目录 <code>.env</code> 或系统环境变量提供配置；优先级为系统环境变量 &gt; <code>.env</code> &gt; 已保存设置。<code>.env</code> 支持的全部变量如下：</li></ol><pre># 阿里云凭据与地域（必填）
+<section class="section" id="configuration"><h2>1. 配置</h2><ol><li>在“阿里云设置”中填写专用 RAM 用户的 AccessKey、地域、启动模板、实例标签池名称；资源组和模板版本可选。</li><li>填写 SOCKS 用户名、密码和代理 API Token。秘密字段留空会保留原值；只有勾选“清除现有密钥”才会清除 AccessKey Secret。</li><li>也可通过同目录 <code>.env.local</code> 或系统环境变量提供配置；优先级为系统环境变量 &gt; <code>.env.local</code> &gt; 已保存设置。没有 <code>.env.local</code> 时兼容读取 <code>.env</code>。<code>.env.local</code> 支持的全部变量如下：</li></ol><pre># 阿里云凭据与地域（必填）
 ALIBABA_CLOUD_ACCESS_KEY_ID=LTAI...
 ALIBABA_CLOUD_ACCESS_KEY_SECRET=...
 ALIYUN_REGION_ID=cn-hangzhou
@@ -200,7 +208,8 @@ PROXY_API_BEARER_TOKEN=your-secret-token</pre><ul><li>建议使用最小权限 R
 <h3>节点列表 — 删除按钮</h3><p>每行节点右侧的“删除”按钮用于手动下线并释放指定 ECS 实例。点击后会弹出确认对话框，确认后先从代理池下线再永久释放。调和执行期间禁用。</p>
 </section>
 <section class="section" id="dante"><h2>3. Dante 启动模板</h2><p>先保存 AccessKey、地域和 SOCKS 凭据，再点“创建启动模板”。选择 Ubuntu 镜像、实例规格、交换机及安全组后，控制台通过 cloud-init 安装并配置 Dante，创建成功会自动回填模板 ID 与版本。</p><ul><li>模板开放 TCP <code>1080</code> 并使用已配置的 SOCKS 用户名和密码；客户端必须使用认证。</li><li>安全组入口应只允许可信客户端公网 IP，避免向全网开放代理端口。</li><li>自定义现有模板时，应保证 Ubuntu 可访问软件源、cloud-init 能执行、Dante 监听配置端口且实例具有公网 IP。</li></ul></section>
-<section class="section" id="scaling"><h2>4. 扩缩容与调和</h2><ol><li>输入 0–1000 的目标节点数并点“应用”。</li><li>点“立即调和”：少于目标时按候选交换机顺序创建实例；多于目标时先将节点从代理池下线，再释放 ECS。</li><li>节点通过 SOCKS 健康检查后才进入“健康”状态。执行期间不要重复操作或手工修改带管理标签的实例。</li><li>新实例创建后需等待约 <strong>60 秒</strong>让 cloud-init 完成 Dante 安装与配置，再触发一次调和执行 SOCKS5 健康检查；提前检测会因服务未就绪而标记为 <code>error</code>。</li><li>目标设为 <code>0</code> 会在调和时回收全部受管节点，请先确认业务流量已迁移。</li></ol></section>
+<section class="section" id="warpgate"><h2>5. WarpGate 启动模板与提取</h2><p>选择 WarpGate 模式后，先填写控制端公网 IP/CIDR 白名单，例如 <code>203.0.113.10/32</code>，再创建启动模板。模板会安装 Docker 和 WarpGate，并开放 API 端口 <code>4433</code>、认证代理端口 <code>10010–10209</code> 及白名单免密代理端口 <code>11010–11209</code>。</p><ul><li>API 白名单只允许控制端访问，不要填写 <code>0.0.0.0/0</code>。</li><li>“提取 IP 类型”选择 IPv4、IPv6 或 IPv4 + IPv6；API 示例：<code>GET /api/proxies?family=ipv4</code>、<code>family=ipv6</code> 或 <code>family=both</code>。</li><li>返回结果包含代理地址、<code>exit_ip</code>、IP 类型和 ECS 节点信息；控制台会自动优先使用白名单免密代理。</li><li>每台 ECS 的出口数量越多，启动和初始化所需时间越长。</li></ul><pre>{"proxy":"socks5://203.0.113.10:10012","proxy_whitelist":"socks5://203.0.113.10:11012","exit_ip":"2001:db8::10","whitelist_mode":true}</pre></section>
+<section class="section" id="scaling"><h2>6. 扩缩容与调和</h2><ol><li>输入 0–1000 的目标节点数并点“应用”。</li><li>点“立即调和”：少于目标时按候选交换机顺序创建实例；多于目标时先将节点从代理池下线，再释放 ECS。</li><li>节点通过 SOCKS 健康检查后才进入“健康”状态。执行期间不要重复操作或手工修改带管理标签的实例。</li><li>新实例创建后需等待约 <strong>60 秒</strong>让 cloud-init 完成 Dante 安装与配置，再触发一次调和执行 SOCKS5 健康检查；提前检测会因服务未就绪而标记为 <code>error</code>。</li><li>目标设为 <code>0</code> 会在调和时回收全部受管节点，请先确认业务流量已迁移。</li></ol></section>
 <section class="section" id="extract-socks"><h2>5. 提取 SOCKS 代理</h2><p>节点进入“健康”状态后，即可提取代理地址。系统提供三种提取方式：</p>
 <h3>方式一：控制台“负载均衡”按钮（快速获取单个代理）</h3><ol><li>点击工具栏“负载均衡”按钮。</li><li>选择调度策略：轮询（默认）、随机、最少连接、最低延迟。</li><li>点“获取代理”，结果区显示一个完整的 SOCKS5 代理 URL。</li><li>控制台内调用无需 Token，适合手动复制使用。</li></ol>
 <h3>方式二：API 获取全部代理列表</h3><p><code>GET /api/proxies</code> 返回当前所有健康代理，必须携带 Bearer Token：</p><pre>curl -H "Authorization: Bearer &lt;API_TOKEN&gt;" http://127.0.0.1:8765/api/proxies</pre><p>成功响应形如：</p><pre>{"proxies":["socks5://user:password@203.0.113.10:1080","socks5://user:password@203.0.113.11:1080"],"count":2}</pre>
@@ -314,11 +323,17 @@ curl "http://127.0.0.1:8765/api/target?target=2&token=&lt;API_TOKEN&gt;"
 # 高峰期恢复 5 节点（每天 08:00）
 curl "http://127.0.0.1:8765/api/target?target=5&token=&lt;API_TOKEN&gt;"</pre></li><li><b>选择入门级规格</b> — 代理转发是 I/O 密集型而非 CPU 密集型，<code>t6</code> / <code>s6</code> / <code>e-instance</code> 等突发性能实例即可满足需求，价格远低于计算型 <code>c6</code>。</li><li><b>合理设置公网带宽</b> — 代理流量波动大时选"按使用流量"计费；流量稳定且大时选"按固定带宽"。</li><li><b>及时释放闲置节点</b> — 不使用时将目标设为 0 并调和，确保所有实例已释放，避免忘记关机持续计费。</li><li><b>关注断路器</b> — 设置合理的断路器阈值（3–5），避免库存不足时反复创建失败浪费 API 调用和时间。</li><li><b>多地域分散部署</b> — 不同地域的抢占式价格和库存不同，多地域部署既能降低被回收风险，也可能获得更低的整体价格。</li></ul>
 </section>
-<section class="section" id="api-control"><h2>12. API 控制</h2><p>除控制台界面外，所有管理操作均可通过 HTTP API 调用。写操作需携带 API Token，可通过 <code>token</code> 查询参数或 <code>Authorization: Bearer</code> 请求头传递。</p><h3>认证方式</h3><pre>curl "http://127.0.0.1:8765/api/reconcile?token=&lt;API_TOKEN&gt;"
-curl -H "Authorization: Bearer &lt;API_TOKEN&gt;" http://127.0.0.1:8765/api/reconcile</pre><h3>查询接口（GET）</h3><ul><li><code>GET /api/status</code> — 节点状态、统计、候选区、事件</li><li><code>GET /api/settings</code> — 当前配置概览（不返回密钥明文）</li><li><code>GET /api/billing</code> — 账户余额与当月账单</li><li><code>GET /api/resources</code> — 可用镜像、规格、交换机、安全组、启动模板</li><li><code>GET /api/proxies</code> — 当前健康代理列表（需 Token）</li><li><code>GET /api/proxies/balanced?strategy=round-robin</code> — 按策略获取单个代理（需 Token）</li></ul><h3>控制接口（GET，需 Token）</h3><ul><li><code>GET /api/reconcile</code> — 立即执行调和，返回操作后状态</li><li><code>GET /api/target?target=5</code> — 设置目标节点数（0–1000 整数），返回更新后状态</li><li><code>GET /api/nodes/delete?instance_id=i-xxx</code> — 下线并释放指定实例，返回操作后状态</li></ul><pre>curl "http://127.0.0.1:8765/api/target?target=6&token=&lt;API_TOKEN&gt;"
-curl "http://127.0.0.1:8765/api/reconcile?token=&lt;API_TOKEN&gt;"
-curl "http://127.0.0.1:8765/api/nodes/delete?instance_id=i-bp1xxx&token=&lt;API_TOKEN&gt;"</pre><p>控制接口成功时返回节点状态 JSON（与 <code>GET /api/status</code> 格式相同）。失败时返回 <code>{"error":"..."}</code> 及对应 HTTP 状态码：401（Token 无效或缺失）、400（参数错误）、409（操作冲突，如调和执行中）、500（内部错误）。</p><p class="warning">API Token 与控制台设置中的代理 API Token 相同。请通过受信网络调用，不要将 Token 写入日志或公开代码。</p></section>
-<section class="section" id="ai-prompt"><h2>13. AI 提示词模板案例</h2><p>本节提供一套面向 AI 的结构化提示词，用于通过自然语言对话引导 AI 完成安全组、交换机、实例规格等核心参数的确认，最终生成可提交到控制台的完整资源配置模板。将以下提示词复制给 AI 助手即可开始交互式配置。</p>
+<section class="section" id="api-control"><h2>12. API 控制与代理接口</h2><p>中控 API 默认地址为 <code>http://127.0.0.1:8765</code>。代理提取、粘性代理和管理操作使用 <code>Authorization: Bearer &lt;API_TOKEN&gt;</code> 请求头认证。管理接口兼容 <code>token</code> 查询参数，但不建议把 Token 放在 URL、日志或浏览器历史中。</p><h3>代理提取与 SOCKS5 使用</h3><p>所有代理接口都从全部健康 ECS/WarpGate 节点组成的统一资源池中提取，业务方不需要直接管理某一台 ECS。<code>server_ip:port</code> 是业务连接的 ECS 入口，<code>exit_ip</code> 才是 WARP 对外访问的真实出口；不要用 ECS 原生公网 IPv4 冒充 WARP IPv4。</p><h4>普通列表</h4><ul><li><code>GET /api/proxies?family=ipv4&amp;protocol=socks5</code> — 只返回真实 IPv4 出口的 SOCKS5 代理。</li><li><code>GET /api/proxies?family=ipv6&amp;protocol=socks5</code> — 只返回真实 IPv6 出口的 SOCKS5 代理。</li><li><code>GET /api/proxies?family=both&amp;protocol=both</code> — 返回两类出口及两种协议，两个参数默认都是 <code>both</code>。</li></ul><p><code>family</code> 只能是 <code>ipv4</code>、<code>ipv6</code>、<code>both</code>；<code>protocol</code> 只能是 <code>socks5</code>、<code>http</code>、<code>both</code>。普通列表适合批量导入或自行选择代理，不保证同一业务后续仍使用同一个代理。</p><pre># SOCKS5 客户端示例
+curl --socks5-hostname warpuser:password@47.238.139.26:10016 https://example.com
+
+# Python requests（需 pip install requests[socks]）
+import requests
+proxy = "socks5h://warpuser:password@47.238.139.26:10016"
+requests.get("https://example.com", proxies={"http": proxy, "https": proxy}, timeout=30)</pre><p>优先使用 <code>socks5h</code> 或 <code>--socks5-hostname</code>，让 DNS 也通过代理解析。IPv6 出口要求客户端能访问中控 API，但连接入口仍使用响应中的 <code>server_ip</code>，不能把带冒号的 <code>exit_ip</code> 直接拼成 SOCKS5 地址。</p><h4>平衡获取</h4><p><code>GET /api/proxies/balanced?strategy=round-robin&amp;family=ipv4&amp;protocol=socks5</code> 每次返回一个代理。<code>strategy</code> 支持 <code>round-robin</code>、<code>random</code>、<code>least-connections</code>、<code>lowest-latency</code>；其中“最少连接”按中控分配计数计算，不是实时 TCP 连接数。适合每次任务只需要一个代理且不要求固定会话的场景。</p><h3>粘性代理规则</h3><p>粘性绑定键为 <code>session_id + family</code>。同一业务标识可以同时拥有一条 IPv4 和一条 IPv6 绑定；同一家庭类型在默认 10 分钟内重复获取返回原代理，重复请求不会刷新 TTL。<code>session_id</code> 可使用邮箱、手机号、账号等非空业务标识。不同会话不会共享同一代理端口；原代理失效时会自动从全部健康 ECS 节点切换。</p><pre># 获取 IPv6 粘性代理
+curl -G -H "Authorization: Bearer &lt;API_TOKEN&gt;" --data-urlencode "session_id=user@example.com" --data-urlencode "family=ipv6" http://127.0.0.1:8765/api/proxies/sticky
+
+# 主动释放
+curl -X DELETE -H "Authorization: Bearer &lt;API_TOKEN&gt;" "http://127.0.0.1:8765/api/proxies/sticky/user%40example.com?family=ipv6"</pre><p>成功响应包含 <code>proxy</code>、<code>server_ip</code>、<code>port</code>、<code>exit_ip</code>、<code>expires_in</code> 和 <code>reused</code>。释放成功或目标绑定不存在都返回 HTTP <code>200</code>。</p><h3>状态与管理接口</h3><ul><li><code>GET /api/status</code> — 节点状态、统计和事件</li><li><code>GET /api/settings</code> — 配置概览，不返回密钥明文</li><li><code>GET /api/billing</code> — 账户余额与账单</li><li><code>GET /api/resources</code> — 云资源信息</li><li><code>GET /api/reconcile</code> — 立即执行调和</li><li><code>GET /api/target?target=5</code> — 设置目标节点数</li><li><code>GET /api/nodes/delete?instance_id=i-xxx</code> — 下线并释放实例</li></ul><p>常见状态码：<code>200</code> 成功，<code>400</code> 参数错误，<code>401</code> Token 缺失或无效，<code>409</code> 没有可用代理资源或操作冲突，<code>500</code> 中控内部错误。</p><p class="warning">WarpGate 模式下，IPv4/IPv6 按 WARP 真实 <code>exit_ip</code> 分类。ECS 原生公网 IPv4 不会被伪装成 WARP IPv4 出口；如果当前节点没有 IPv4 WARP 出口，<code>family=ipv4</code> 会返回 HTTP 409。</p></section><section class="section" id="ai-prompt"><h2>13. AI 提示词模板案例</h2><p>本节提供一套面向 AI 的结构化提示词，用于通过自然语言对话引导 AI 完成安全组、交换机、实例规格等核心参数的确认，最终生成可提交到控制台的完整资源配置模板。将以下提示词复制给 AI 助手即可开始交互式配置。</p>
 
 <h3>13.1 使用方法</h3><ol><li>将下方"系统提示词"发送给 AI 助手。</li><li>AI 会逐步询问地域、安全组、交换机、实例规格等参数。</li><li>通过自然语言回答或调整，AI 会实时更新配置草案。</li><li>确认无误后，AI 输出完整的 JSON 配置模板。</li><li>将 JSON 中的参数填入控制台"阿里云设置"和"创建启动模板"对话框。</li></ol>
 
@@ -533,6 +548,99 @@ def _validate_spot_duration(value: str) -> str:
     return value
 
 
+def _validate_family(value: str) -> str:
+    if value not in ("ipv4", "ipv6"):
+        raise ValueError("family 必须是 ipv4 或 ipv6")
+    return value
+
+
+class StickySessionManager:
+    TTL = 600
+
+    def __init__(self, pool_getter: Any, clock: Any = time.time) -> None:
+        self._pool_getter = pool_getter
+        self._clock = clock
+        self._bindings: dict[tuple[str, str], dict[str, Any]] = {}
+        self._occupied: dict[tuple[str, str, int], tuple[str, str]] = {}
+        self._lock = threading.RLock()
+        self._rr_index = 0
+
+    @staticmethod
+    def _key(item: dict[str, Any]) -> tuple[str, str, int]:
+        return (str(item.get("instance_id") or item.get("node_id") or ""),
+                str(item.get("server_ip") or ""), int(item.get("port") or 0))
+
+    @staticmethod
+    def _response(item: dict[str, Any], session_id: str, family: str,
+                  expires_at: float, now: float, reused: bool, failover: bool = False) -> dict[str, Any]:
+        from urllib.parse import quote, urlparse, urlunparse
+
+        result = dict(item)
+        proxy = item.get("proxy") or item.get("proxy_whitelist") or ""
+        parsed = urlparse(proxy)
+        username = item.get("username") or parsed.username or ""
+        password = item.get("password") or parsed.password or ""
+        if username and password and parsed.hostname:
+            auth = f"{quote(str(username), safe='')}:{quote(str(password), safe='')}@"
+            proxy = urlunparse((parsed.scheme or "socks5", auth + parsed.hostname + ":" + str(parsed.port or item.get("port") or 0), "", "", "", ""))
+        proxy_port = parsed.port or int(item.get("port") or 0)
+        result.update({
+            "sticky": True, "session_id": session_id, "family": family,
+            "proxy": proxy,
+            "node_id": item.get("instance_id") or item.get("node_id") or "",
+            "server_ip": item.get("server_ip") or parsed.hostname or "", "port": proxy_port,
+            "expires_at": datetime.fromtimestamp(expires_at, timezone.utc).isoformat(),
+            "expires_in": max(0, int(expires_at - now)), "reused": reused,
+        })
+        if failover:
+            result["failover"] = True
+        return result
+
+    def get(self, session_id: str, family: str) -> dict[str, Any]:
+        if not isinstance(session_id, str) or not session_id:
+            raise ValueError("session_id 不能为空")
+        family = _validate_family(family)
+        now = self._clock()
+        key = (session_id, family)
+        with self._lock:
+            binding = self._bindings.get(key)
+            if binding and binding["expires_at"] <= now:
+                self._occupied.pop(binding["proxy_key"], None)
+                self._bindings.pop(key, None)
+                binding = None
+            pool = self._pool_getter()
+            if isinstance(pool, UnavailableProxyPoolAdapter):
+                raise RuntimeError("代理池未配置")
+            candidates = [item for item in pool.proxies() if item.get("family") == family]
+            by_key = {self._key(item): item for item in candidates}
+            if binding and binding["proxy_key"] in by_key:
+                return self._response(by_key[binding["proxy_key"]], session_id, family,
+                                      binding["expires_at"], now, True)
+            if binding:
+                self._occupied.pop(binding["proxy_key"], None)
+                self._bindings.pop(key, None)
+            available = [item for item in candidates
+                         if self._key(item) not in self._occupied]
+            if not available:
+                raise RuntimeError("没有可用的代理资源")
+            item = available[self._rr_index % len(available)]
+            self._rr_index += 1
+            proxy_key = self._key(item)
+            expires_at = now + self.TTL
+            self._occupied[proxy_key] = key
+            self._bindings[key] = {"proxy_key": proxy_key, "expires_at": expires_at}
+            return self._response(item, session_id, family, expires_at, now, False, bool(binding))
+
+    def delete(self, session_id: str, family: str) -> None:
+        if not isinstance(session_id, str) or not session_id:
+            raise ValueError("session_id 不能为空")
+        family = _validate_family(family)
+        with self._lock:
+            binding = self._bindings.pop((session_id, family), None)
+            if binding:
+                self._occupied.pop(binding["proxy_key"], None)
+
+
 class DashboardService:
     SETTINGS_FIELDS = {
         "access_key_id",
@@ -543,12 +651,19 @@ class DashboardService:
         "resource_group_id",
         "pool_name",
         "socks5_port",
+        "http_proxy_port",
         "socks5_username",
         "socks5_password",
         "socks5_check_host",
         "socks5_check_port",
         "socks5_timeout",
+        "proxy_mode",
+        "warpgate_api_port",
+        "warpgate_instances",
+        "warpgate_ip_family",
+        "warpgate_whitelist_ip",
         "proxy_api_bearer_token",
+        "target_nodes",
         "clear_secret",
         "batch_size",
         "pending_timeout_minutes",
@@ -566,26 +681,36 @@ class DashboardService:
         "resource_group_id": "",
         "pool_name": "",
         "socks5_port": "1080",
+        "http_proxy_port": "8080",
         "socks5_username": "",
         "socks5_password": "",
         "socks5_check_host": "1.1.1.1",
         "socks5_check_port": "80",
         "socks5_timeout": "5",
+        "proxy_mode": "socks5",
+        "warpgate_api_port": "4433",
+        "warpgate_instances": "20",
+        "warpgate_ip_family": "both",
+        "warpgate_whitelist_ip": "",
         "proxy_api_bearer_token": "",
+        "target_nodes": "4",
         "batch_size": "3",
         "pending_timeout_minutes": "5",
-        "auto_reconcile_interval": "0",
+        "auto_reconcile_interval": "120",
         "circuit_breaker_threshold": "3",
         "instance_charge_type": "PostPaid",
         "spot_duration": "0",
     }
     HOT_CONFIG_FIELDS = {
+        "target_nodes": lambda v: _validate_int(v, 0, 1000, "target_nodes"),
         "batch_size": lambda v: _validate_int(v, 1, 50, "batch_size"),
         "pending_timeout_minutes": lambda v: _validate_int(v, 1, 120, "pending_timeout_minutes"),
         "auto_reconcile_interval": lambda v: _validate_int(v, 0, 3600, "auto_reconcile_interval"),
         "circuit_breaker_threshold": lambda v: _validate_int(v, 1, 20, "circuit_breaker_threshold"),
         "instance_charge_type": _validate_charge_type,
         "spot_duration": _validate_spot_duration,
+        "warpgate_api_port": lambda v: _validate_int(v, 1, 65535, "warpgate_api_port"),
+        "warpgate_instances": lambda v: _validate_int(v, 1, 200, "warpgate_instances"),
     }
     TEMPLATE_FIELDS = {
         "launch_template_name", "description", "image_id", "instance_type",
@@ -605,7 +730,11 @@ class DashboardService:
         self.lock = threading.RLock()
         self.running = False
         self.settings_path = Path(settings_path) if settings_path is not None else Path(__file__).with_name("dashboard_settings.json")
-        self.env_path = Path(env_path) if env_path is not None else Path(__file__).with_name(".env")
+        if env_path is not None:
+            self.env_path = Path(env_path)
+        else:
+            local_env = Path(__file__).with_name(".env.local")
+            self.env_path = local_env if local_env.exists() else Path(__file__).with_name(".env")
         self._settings = self._load_settings()
         self.last_reconcile: datetime | None = None
         self.last_result: ReconcileResult | None = None
@@ -619,9 +748,13 @@ class DashboardService:
         self._next_auto_reconcile: datetime | None = None
         self.ecs: AliyunECSAdapter | None = None
         self.proxy = self._make_proxy_pool()
+        self.sticky = StickySessionManager(lambda: self.proxy)
         self.candidates: tuple[LaunchCandidate, ...] = ()
         self.store = SQLiteStateStore(":memory:")
-        self.target = 4
+        try:
+            self.target = int(self._settings.get("target_nodes", "4") or "4")
+        except ValueError:
+            self.target = 4
         startup_error = ""
         if self._is_aliyun_configured():
             try:
@@ -651,7 +784,7 @@ class DashboardService:
                 logging.exception("无法读取阿里云设置，将使用环境配置")
 
         for key, value in load_dotenv_settings(self.env_path).items():
-            if value:
+            if value and not (key == "region_id" and settings.get("region_id")):
                 settings[key] = value
         return settings
 
@@ -659,8 +792,20 @@ class DashboardService:
         required = ("access_key_id", "access_key_secret", "region_id", "launch_template_id", "pool_name")
         return all(self._settings[key] for key in required)
 
-    def _make_proxy_pool(self) -> Socks5ProxyPool | UnavailableProxyPoolAdapter:
-        required = ("socks5_username", "socks5_password", "proxy_api_bearer_token")
+    def _make_proxy_pool(self) -> Socks5ProxyPool | WarpGateProxyPool | UnavailableProxyPoolAdapter:
+        if not self._settings["proxy_api_bearer_token"]:
+            return UnavailableProxyPoolAdapter()
+        if self._settings.get("proxy_mode", "socks5") == "warpgate":
+            try:
+                return WarpGateProxyPool(
+                    api_port=int(self._settings["warpgate_api_port"]),
+                    instance_count=int(self._settings["warpgate_instances"]),
+                    ip_family=self._settings["warpgate_ip_family"],
+                    timeout=float(self._settings["socks5_timeout"]),
+                )
+            except ValueError as exc:
+                raise ValueError("WarpGate 端口、实例数、IP 类型或超时配置无效") from exc
+        required = ("socks5_username", "socks5_password")
         if not all(self._settings[key] for key in required):
             return UnavailableProxyPoolAdapter()
         try:
@@ -674,27 +819,62 @@ class DashboardService:
         return Socks5ProxyPool(
             port, self._settings["socks5_username"], self._settings["socks5_password"],
             self._settings["socks5_check_host"], check_port, timeout,
+            int(self._settings.get("http_proxy_port", "8080")),
         )
 
     def _adapter_name(self) -> str:
         return "阿里云 ECS" if self.ecs else "未配置"
 
-    def proxy_list(self, authorization: str | None) -> dict[str, Any]:
+    def proxy_list(
+        self,
+        authorization: str | None,
+        family: str = "both",
+        protocol: str = "both",
+    ) -> dict[str, Any]:
         token = self._settings["proxy_api_bearer_token"]
         supplied = authorization[7:] if authorization and authorization.startswith("Bearer ") else ""
         if not token or not hmac.compare_digest(supplied, token):
             raise PermissionError("Bearer 凭据无效")
-        if not isinstance(self.proxy, Socks5ProxyPool):
-            raise RuntimeError("SOCKS5 代理池未配置")
-        proxies = self.proxy.proxies()
-        return {"proxies": proxies, "count": len(proxies)}
+        if family not in ("ipv4", "ipv6", "both"):
+            raise ValueError("family 必须是 ipv4、ipv6 或 both")
+        if protocol not in ("socks5", "http", "both"):
+            raise ValueError("protocol 必须是 socks5、http 或 both")
+        if isinstance(self.proxy, UnavailableProxyPoolAdapter):
+            raise RuntimeError("代理池未配置")
+        proxies = self.proxy.proxies(protocol) if isinstance(self.proxy, Socks5ProxyPool) else self.proxy.proxies()
+        if isinstance(self.proxy, WarpGateProxyPool) and family != "both":
+            proxies = [item for item in proxies if item.get("family") == family]
+        return {"proxies": proxies, "count": len(proxies), "family": family, "protocol": protocol}
 
     def authenticate(self, token: str) -> bool:
-        """验证 API 控制令牌"""
+        """验证登录 Key。"""
         configured = self._settings["proxy_api_bearer_token"]
-        if not configured:
-            return False
-        return hmac.compare_digest(token, configured)
+        return bool(configured) and bool(token) and hmac.compare_digest(token, configured)
+
+    def _resolve_builtin_template(self, settings: dict[str, str]) -> dict[str, str]:
+        template_choice = settings.get("launch_template_id", "builtin-dante")
+        proxy_mode = "warpgate" if template_choice in ("builtin-warpgate", BUILTIN_WARPGATE_TEMPLATE_NAME) else "socks5"
+        template_name = BUILTIN_WARPGATE_TEMPLATE_NAME if proxy_mode == "warpgate" else BUILTIN_DANTE_TEMPLATE_NAME
+        settings["proxy_mode"] = proxy_mode
+        adapter = AliyunECSAdapter(
+            settings["access_key_id"], settings["access_key_secret"], settings["region_id"], "",
+            resource_group_id=settings["resource_group_id"],
+            instance_charge_type=settings.get("instance_charge_type", "PostPaid"),
+            spot_duration=int(settings.get("spot_duration", "0")),
+            proxy_mode=proxy_mode,
+            socks5_port=int(settings.get("socks5_port", "1080")),
+            http_proxy_port=int(settings.get("http_proxy_port", "8080")),
+            warpgate_api_port=int(settings.get("warpgate_api_port", "4433")),
+            warpgate_instances=int(settings.get("warpgate_instances", "20")),
+            warpgate_whitelist_ip=settings.get("warpgate_whitelist_ip", ""),
+        )
+        if proxy_mode == "socks5" and not settings.get("socks5_password"):
+            raise RuntimeError("创建内置 Dante 模板前必须先配置 SOCKS5 密码")
+        return adapter.ensure_builtin_launch_template(
+            template_name,
+            settings.get("socks5_username", ""),
+            settings.get("socks5_password", ""),
+        )
 
     def _build_adapter(self, settings: dict[str, str]) -> tuple[Any, tuple]:
         """Create adapter and discover candidates from a settings dict (no self mutation, may do network I/O)."""
@@ -705,8 +885,14 @@ class DashboardService:
             settings["access_key_id"], settings["access_key_secret"],
             settings["region_id"], settings["launch_template_id"],
             settings["launch_template_version"], settings["resource_group_id"],
-            settings.get("instance_charge_type", "PostPaid"),
-            int(settings.get("spot_duration", "0")),
+            instance_charge_type=settings.get("instance_charge_type", "PostPaid"),
+            spot_duration=int(settings.get("spot_duration", "0")),
+            proxy_mode=settings.get("proxy_mode", "socks5"),
+            socks5_port=int(settings.get("socks5_port", "1080")),
+            http_proxy_port=int(settings.get("http_proxy_port", "8080")),
+            warpgate_api_port=int(settings.get("warpgate_api_port", "4433")),
+            warpgate_instances=int(settings.get("warpgate_instances", "20")),
+            warpgate_whitelist_ip=settings.get("warpgate_whitelist_ip", ""),
         )
         candidates = adapter.discover_launch_candidates()
         return adapter, candidates
@@ -738,7 +924,13 @@ class DashboardService:
                 "resource_group_id": self._settings["resource_group_id"],
                 "pool_name": self._settings["pool_name"],
                 "proxy_configured": not isinstance(self.proxy, UnavailableProxyPoolAdapter),
+                "proxy_mode": self._settings.get("proxy_mode", "socks5"),
+                "warpgate_api_port": self._settings.get("warpgate_api_port", "4433"),
+                "warpgate_instances": self._settings.get("warpgate_instances", "20"),
+                "warpgate_ip_family": self._settings.get("warpgate_ip_family", "both"),
+                "warpgate_whitelist_ip": self._settings.get("warpgate_whitelist_ip", ""),
                 "socks5_port": self._settings["socks5_port"],
+                "http_proxy_port": self._settings.get("http_proxy_port", "8080"),
                 "socks5_username": self._settings["socks5_username"],
                 "socks5_password_configured": bool(self._settings["socks5_password"]),
                 "proxy_api_bearer_token_configured": bool(self._settings["proxy_api_bearer_token"]),
@@ -746,6 +938,7 @@ class DashboardService:
                 "adapter": self._adapter_name(),
                 "batch_size": self._settings.get("batch_size", "3"),
                 "pending_timeout_minutes": self._settings.get("pending_timeout_minutes", "5"),
+                "target_nodes": str(self.target),
                 "auto_reconcile_interval": self._settings.get("auto_reconcile_interval", "0"),
                 "circuit_breaker_threshold": self._settings.get("circuit_breaker_threshold", "3"),
                 "instance_charge_type": self._settings.get("instance_charge_type", "PostPaid"),
@@ -756,13 +949,23 @@ class DashboardService:
         if not isinstance(value, str):
             raise ValueError(f"{key} 必须是字符串")
         value = value.strip()
+        if key == "proxy_mode" and value not in ("socks5", "warpgate"):
+            raise ValueError("proxy_mode 必须是 socks5 或 warpgate")
+        if key == "warpgate_ip_family" and value not in ("ipv4", "ipv6", "both"):
+            raise ValueError("warpgate_ip_family 必须是 ipv4、ipv6 或 both")
+        if key == "warpgate_whitelist_ip":
+            try:
+                network = ipaddress.ip_network(value, strict=False)
+            except ValueError as exc:
+                raise ValueError("warpgate_whitelist_ip 必须是有效的 IP 或 CIDR") from exc
+            value = str(network)
         secret_fields = {"access_key_secret", "socks5_password", "proxy_api_bearer_token"}
         maximum = 256 if key in secret_fields else 128
         if len(value) > maximum:
             raise ValueError(f"{key} 长度不能超过 {maximum}")
         if required and not value:
             raise ValueError(f"{key} 不能为空")
-        if value and key not in secret_fields and not self.IDENTIFIER_PATTERN.fullmatch(value):
+        if value and key not in secret_fields and key != "warpgate_whitelist_ip" and not self.IDENTIFIER_PATTERN.fullmatch(value):
             raise ValueError(f"{key} 包含不允许的字符")
         return value
 
@@ -794,7 +997,17 @@ class DashboardService:
                 if key in data and data[key] != "":
                     updated[key] = self._validate_setting(key, data[key], required=True)
 
-        # Phase 2: build adapter outside lock (network I/O, may be slow)
+        # Phase 2: resolve the name in the target account, then build the adapter outside lock.
+        builtin_templates = {
+            "builtin",
+            "builtin-dante",
+            "builtin-warpgate",
+            BUILTIN_DANTE_TEMPLATE_NAME,
+            BUILTIN_WARPGATE_TEMPLATE_NAME,
+        }
+        if updated.get("launch_template_id") in builtin_templates:
+            resolved = self._resolve_builtin_template(updated)
+            updated.update(resolved)
         adapter, candidates = self._build_adapter(updated)
 
         # Phase 3: commit under lock (quick)
@@ -808,6 +1021,7 @@ class DashboardService:
                 self.ecs = adapter
                 self.candidates = candidates
                 self.proxy = self._make_proxy_pool()
+                self.target = int(updated.get("target_nodes", "4") or "4")
                 controller = self._make_controller() if self.ecs else None
             except Exception:
                 self._settings = previous
@@ -826,6 +1040,10 @@ class DashboardService:
             self._stop_auto_reconcile()
             self._start_auto_reconcile()
             self._event(f"设置已更新，当前状态：{self._adapter_name()}")
+        try:
+            self.reconcile()
+        except RuntimeError as exc:
+            self._event(f"保存后自动调和未执行：{exc}")
 
     def _write_settings(self, settings: dict[str, str]) -> None:
         self.settings_path.parent.mkdir(parents=True, exist_ok=True)
@@ -870,34 +1088,6 @@ class DashboardService:
             )
             return adapter.query_resources()
 
-    def create_security_group(self, data: dict[str, Any]) -> dict[str, str]:
-        unknown = set(data) - self.SECURITY_GROUP_FIELDS
-        if unknown:
-            raise ValueError(f"包含未知字段：{', '.join(sorted(unknown))}")
-        if set(data) != self.SECURITY_GROUP_FIELDS:
-            raise ValueError("security_group_name、description 和 v_switch_id 均为必填字段")
-        name = data.get("security_group_name")
-        description = data.get("description")
-        v_switch_id = data.get("v_switch_id")
-        if not isinstance(name, str) or not self.RESOURCE_NAME_PATTERN.fullmatch(name):
-            raise ValueError("security_group_name 不符合严格白名单")
-        if not isinstance(description, str) or not self.DESCRIPTION_PATTERN.fullmatch(description):
-            raise ValueError("description 不符合严格白名单")
-        v_switch_id = self._validate_setting("v_switch_id", v_switch_id, required=True)
-        with self.lock:
-            if self.running:
-                raise RuntimeError("reconcile 执行期间不能创建安全组")
-            required_settings = ("access_key_id", "access_key_secret", "region_id")
-            if not all(self._settings[key] for key in required_settings):
-                raise RuntimeError("创建安全组前必须先保存 AccessKey 和地域")
-            adapter = self.ecs or AliyunECSAdapter(
-                self._settings["access_key_id"], self._settings["access_key_secret"],
-                self._settings["region_id"], "", resource_group_id=self._settings["resource_group_id"],
-            )
-            result = adapter.create_security_group(name, description, v_switch_id)
-            self._event(f"已创建普通 VPC 安全组 {result['security_group_id']}")
-            return result
-
     def create_launch_template(self, data: dict[str, Any]) -> dict[str, str]:
         unknown = set(data) - self.TEMPLATE_FIELDS
         if unknown:
@@ -920,18 +1110,30 @@ class DashboardService:
                 else:
                     value = self._validate_setting(key, value, required=True)
                 values[key] = value
-            if not self._settings["socks5_username"] or not self._settings["socks5_password"]:
-                raise RuntimeError("创建启动模板前必须先配置 SOCKS5 用户名和密码")
+            proxy_mode = self._settings.get("proxy_mode", "socks5")
+            if proxy_mode == "socks5" and (not self._settings["socks5_username"] or not self._settings["socks5_password"]):
+                raise RuntimeError("创建 Dante 模板前必须先配置 SOCKS5 用户名和密码")
+            if proxy_mode == "warpgate" and self._settings.get("warpgate_whitelist_ip") in ("", "0.0.0.0/0"):
+                raise RuntimeError("WarpGate API 白名单禁止使用 0.0.0.0/0，请填写控制端公网 IP/CIDR")
             adapter = AliyunECSAdapter(
                 self._settings["access_key_id"], self._settings["access_key_secret"],
                 self._settings["region_id"], "", resource_group_id=self._settings["resource_group_id"],
                 instance_charge_type=self._settings.get("instance_charge_type", "PostPaid"),
                 spot_duration=int(self._settings.get("spot_duration", "0")),
+                proxy_mode=proxy_mode,
+                socks5_port=int(self._settings.get("socks5_port", "1080")),
+                http_proxy_port=int(self._settings.get("http_proxy_port", "8080")),
+                warpgate_api_port=int(self._settings.get("warpgate_api_port", "4433")),
+                warpgate_instances=int(self._settings.get("warpgate_instances", "20")),
+                warpgate_whitelist_ip=self._settings.get("warpgate_whitelist_ip", ""),
             )
             result = adapter.create_launch_template(
                 **values,
                 socks5_username=self._settings["socks5_username"],
                 socks5_password=self._settings["socks5_password"],
+                proxy_mode=proxy_mode,
+                warpgate_instances=int(self._settings["warpgate_instances"]),
+                warpgate_whitelist_ip=self._settings["warpgate_whitelist_ip"],
             )
             updated = dict(self._settings)
             updated.update(result)
@@ -990,6 +1192,8 @@ class DashboardService:
             if self.running:
                 raise RuntimeError("reconcile 执行期间不能修改目标节点数")
             self.target = target
+            self._settings["target_nodes"] = str(target)
+            self._write_settings(self._settings)
             self.controller = self._make_controller() if self.ecs else None
             self._event(f"目标节点数调整为 {target}")
 
@@ -1062,6 +1266,43 @@ class DashboardService:
                 self._auto_reconcile_timer = None
             self._next_auto_reconcile = None
 
+    @staticmethod
+    def _validate_proxy_test_host(host: str) -> None:
+        normalized = host.rstrip(".").lower()
+        if not normalized or normalized == "localhost" or normalized.endswith(".localhost"):
+            raise ValueError("target_url 目标地址不允许访问本机或内部网络")
+
+        def require_public(address: str) -> None:
+            try:
+                ip = ipaddress.ip_address(address.split("%", 1)[0])
+            except ValueError as exc:
+                raise ValueError("target_url 主机名解析结果无效") from exc
+            if not ip.is_global:
+                raise ValueError("target_url 目标地址不允许访问本机或内部网络")
+
+        try:
+            require_public(normalized)
+            return
+        except ValueError as exc:
+            try:
+                ipaddress.ip_address(normalized.split("%", 1)[0])
+            except ValueError:
+                pass
+            else:
+                raise exc
+
+        try:
+            addresses = {
+                item[4][0]
+                for item in socket.getaddrinfo(normalized, None, type=socket.SOCK_STREAM)
+            }
+        except (OSError, UnicodeError) as exc:
+            raise ValueError("target_url 主机名无法解析") from exc
+        if not addresses:
+            raise ValueError("target_url 主机名无法解析")
+        for address in addresses:
+            require_public(address)
+
     def proxy_test(self, data: dict[str, Any]) -> dict[str, Any]:
         """通过指定代理节点向目标发起 HTTP GET 测试。"""
         if set(data) != {"instance_id", "target_url"}:
@@ -1080,6 +1321,7 @@ class DashboardService:
             target_path += "?" + parsed.query
         if not target_host:
             raise ValueError("target_url 缺少主机名")
+        self._validate_proxy_test_host(target_host)
         with self.lock:
             if isinstance(self.proxy, UnavailableProxyPoolAdapter):
                 raise RuntimeError("代理池未配置")
@@ -1094,35 +1336,77 @@ class DashboardService:
             proxy.record_traffic(instance_id, 0, result.get("response_size", 0))
         return result
 
-    def balanced_proxy(self, strategy: str, authorization: str | None) -> dict[str, Any]:
-        """按负载均衡策略返回单个代理 URL。"""
+    def sticky_proxy(self, session_id: str, family: str, authorization: str | None) -> dict[str, Any]:
         token = self._settings["proxy_api_bearer_token"]
         supplied = authorization[7:] if authorization and authorization.startswith("Bearer ") else ""
         if not token or not hmac.compare_digest(supplied, token):
             raise PermissionError("Bearer 凭据无效")
         with self.lock:
-            if isinstance(self.proxy, UnavailableProxyPoolAdapter):
-                raise RuntimeError("SOCKS5 代理池未配置")
+            if not isinstance(self.proxy, WarpGateProxyPool):
+                raise RuntimeError("粘性代理仅支持 WarpGate 模式")
             proxy = self.proxy
-        if strategy not in ("round-robin", "random", "least-connections", "lowest-latency"):
-            strategy = "round-robin"
-        url = proxy.acquire(strategy) if hasattr(proxy, "acquire") else None
-        if not url:
-            raise RuntimeError("代理池为空")
-        return {"proxy": url, "strategy": strategy}
+            nodes = self.ecs.snapshot(self._settings["pool_name"]) if self.ecs else []
+            for node in nodes:
+                if node.status == "Running" and node.public_ip and not node.recycling:
+                    proxy.enable(node.instance_id, node.public_ip)
+            proxy.refresh()
+        return self.sticky.get(session_id, family)
 
-    def balanced_proxy_local(self, strategy: str) -> dict[str, Any]:
-        """控制台内部调用负载均衡，不需要 API Token。"""
+    def delete_sticky_proxy(self, session_id: str, family: str, authorization: str | None) -> None:
+        token = self._settings["proxy_api_bearer_token"]
+        supplied = authorization[7:] if authorization and authorization.startswith("Bearer ") else ""
+        if not token or not hmac.compare_digest(supplied, token):
+            raise PermissionError("Bearer 凭据无效")
+        self.sticky.delete(session_id, family)
+
+    def balanced_proxy(
+        self,
+        strategy: str,
+        authorization: str | None,
+        protocol: str = "socks5",
+    ) -> dict[str, Any]:
+        """按负载均衡策略返回单个代理 URL。"""
+        token = self._settings["proxy_api_bearer_token"]
+        supplied = authorization[7:] if authorization and authorization.startswith("Bearer ") else ""
+        if not token or not hmac.compare_digest(supplied, token):
+            raise PermissionError("Bearer 凭据无效")
+        if protocol not in ("socks5", "http"):
+            raise ValueError("protocol 必须是 socks5 或 http")
         with self.lock:
             if isinstance(self.proxy, UnavailableProxyPoolAdapter):
                 raise RuntimeError("SOCKS5 代理池未配置")
             proxy = self.proxy
         if strategy not in ("round-robin", "random", "least-connections", "lowest-latency"):
             strategy = "round-robin"
-        url = proxy.acquire(strategy) if hasattr(proxy, "acquire") else None
+        if isinstance(proxy, Socks5ProxyPool):
+            url = proxy.acquire(strategy, protocol)
+        elif protocol == "socks5" and hasattr(proxy, "acquire"):
+            url = proxy.acquire(strategy)
+        else:
+            raise ValueError("当前代理模式不支持 HTTP 协议")
         if not url:
             raise RuntimeError("代理池为空")
-        return {"proxy": url, "strategy": strategy}
+        return {"proxy": url, "strategy": strategy, "protocol": protocol}
+
+    def balanced_proxy_local(self, strategy: str, protocol: str = "socks5") -> dict[str, Any]:
+        """控制台内部调用负载均衡，不需要 API Token。"""
+        if protocol not in ("socks5", "http"):
+            raise ValueError("protocol 必须是 socks5 或 http")
+        with self.lock:
+            if isinstance(self.proxy, UnavailableProxyPoolAdapter):
+                raise RuntimeError("SOCKS5 代理池未配置")
+            proxy = self.proxy
+        if strategy not in ("round-robin", "random", "least-connections", "lowest-latency"):
+            strategy = "round-robin"
+        if isinstance(proxy, Socks5ProxyPool):
+            url = proxy.acquire(strategy, protocol)
+        elif protocol == "socks5" and hasattr(proxy, "acquire"):
+            url = proxy.acquire(strategy)
+        else:
+            raise ValueError("当前代理模式不支持 HTTP 协议")
+        if not url:
+            raise RuntimeError("代理池为空")
+        return {"proxy": url, "strategy": strategy, "protocol": protocol}
 
     def reconcile(self) -> None:
         with self.lock:
@@ -1275,9 +1559,7 @@ class Handler(BaseHTTPRequestHandler):
         )
 
     def _is_authorized(self) -> bool:
-        """本机请求或携带有效 Bearer Token 的请求均允许写操作。"""
-        if self._is_local_request():
-            return True
+        """仅允许携带有效 Bearer Token 的请求。"""
         auth = self.headers.get("Authorization", "")
         supplied = auth[7:] if auth.startswith("Bearer ") else ""
         return self.service.authenticate(supplied)
@@ -1312,7 +1594,20 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Security-Policy", "default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'")
             self.end_headers()
             self.wfile.write(body)
-        elif path == "/api/status":
+            return
+        if path == "/healthz":
+            self._json({"ok": True})
+            return
+        if path.startswith("/api/") and not self._is_authorized():
+            query = parse_qs(urlparse(self.path).query)
+            legacy_token_paths = {
+                "/api/proxies/balanced", "/api/reconcile", "/api/target", "/api/nodes/delete",
+            }
+            query_token = query.get("token", [""])[0]
+            if path not in legacy_token_paths or not self.service.authenticate(query_token):
+                self._json({"error": "API token 无效或缺失"}, 401)
+                return
+        if path == "/api/status":
             self._json(self.service.status())
         elif path == "/api/settings":
             self._json(self.service.settings())
@@ -1322,14 +1617,32 @@ class Handler(BaseHTTPRequestHandler):
             self._json(self.service.resources())
         elif path == "/api/proxies":
             try:
-                self._json(self.service.proxy_list(self.headers.get("Authorization")))
+                params = parse_qs(urlparse(self.path).query)
+                family = params.get("family", ["both"])[0]
+                protocol = params.get("protocol", ["both"])[0]
+                self._json(self.service.proxy_list(self.headers.get("Authorization"), family, protocol))
             except PermissionError as exc:
                 self._json({"error": str(exc)}, 401)
+            except ValueError as exc:
+                self._json({"error": str(exc)}, 400)
+            except RuntimeError as exc:
+                self._json({"error": self.service.redact(exc)}, 409)
+        elif path == "/api/proxies/sticky":
+            params = parse_qs(urlparse(self.path).query)
+            try:
+                self._json(self.service.sticky_proxy(
+                    params.get("session_id", [""])[0], params.get("family", [""])[0],
+                    self.headers.get("Authorization")))
+            except PermissionError as exc:
+                self._json({"error": str(exc)}, 401)
+            except ValueError as exc:
+                self._json({"error": str(exc)}, 400)
             except RuntimeError as exc:
                 self._json({"error": self.service.redact(exc)}, 409)
         elif path == "/api/proxies/balanced":
             params = parse_qs(urlparse(self.path).query)
             strategy = params.get("strategy", ["round-robin"])[0]
+            protocol = params.get("protocol", ["socks5"])[0]
             supplied = params.get("token", [""])[0] if params.get("token") else ""
             if not supplied:
                 auth = self.headers.get("Authorization", "")
@@ -1339,9 +1652,20 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"error": "API token 无效或缺失"}, 401)
                 return
             try:
-                self._json(self.service.balanced_proxy(strategy, self.headers.get("Authorization")))
+                authorization = self.headers.get("Authorization")
+                if not authorization and supplied:
+                    authorization = f"Bearer {supplied}"
+                self._json(
+                    self.service.balanced_proxy(
+                        strategy,
+                        authorization,
+                        protocol,
+                    )
+                )
             except PermissionError as exc:
                 self._json({"error": str(exc)}, 401)
+            except ValueError as exc:
+                self._json({"error": str(exc)}, 400)
             except RuntimeError as exc:
                 self._json({"error": self.service.redact(exc)}, 409)
         elif path in {"/api/reconcile", "/api/target", "/api/nodes/delete"}:
@@ -1383,9 +1707,34 @@ class Handler(BaseHTTPRequestHandler):
             logging.error("API 控制执行失败")
             self._json({"error": "服务器内部错误"}, 500)
 
+    def do_DELETE(self) -> None:
+        path = urlparse(self.path).path
+        prefix = "/api/proxies/sticky/"
+        if not path.startswith(prefix):
+            self._json({"error": "接口不存在"}, 404)
+            return
+        params = parse_qs(urlparse(self.path).query)
+        try:
+            self.service.delete_sticky_proxy(
+                unquote(path[len(prefix):]), params.get("family", [""])[0],
+                self.headers.get("Authorization"))
+            self._json({"ok": True})
+        except PermissionError as exc:
+            self._json({"error": str(exc)}, 401)
+        except ValueError as exc:
+            self._json({"error": str(exc)}, 400)
+
     def do_POST(self) -> None:
         path = urlparse(self.path).path
         try:
+            if path == "/api/login":
+                body = self._body()
+                key = str(body.get("key", ""))
+                if not self.service.authenticate(key):
+                    self._json({"error": "登录 Key 不正确"}, 401)
+                else:
+                    self._json({"ok": True})
+                return
             if not self._is_authorized():
                 self._json({"error": "仅允许本机操作或携带有效 Token"}, 403)
                 return
@@ -1402,15 +1751,14 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/settings":
                 self.service.save_settings(body)
                 response = self.service.settings()
-            elif path == "/api/security-groups":
-                response = self.service.create_security_group(body)
             elif path == "/api/launch-templates":
                 response = self.service.create_launch_template(body)
             elif path == "/api/proxy-test":
                 response = self.service.proxy_test(body)
             elif path == "/api/proxies/balanced":
                 strategy = body.get("strategy", "round-robin")
-                response = self.service.balanced_proxy_local(strategy)
+                protocol = body.get("protocol", "socks5")
+                response = self.service.balanced_proxy_local(strategy, protocol)
             else:
                 self._json({"error": "接口不存在"}, 404)
                 return

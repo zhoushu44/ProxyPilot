@@ -17,14 +17,16 @@ class Socks5ProxyPool:
         check_host: str = "1.1.1.1",
         check_port: int = 80,
         timeout: float = 5.0,
+        http_port: int = 8080,
     ) -> None:
-        if not 1 <= port <= 65535 or not 1 <= check_port <= 65535:
-            raise ValueError("SOCKS5 端口必须为 1–65535")
+        if not 1 <= port <= 65535 or not 1 <= http_port <= 65535 or not 1 <= check_port <= 65535:
+            raise ValueError("代理端口必须为 1–65535")
         if not username or not password:
             raise ValueError("SOCKS5 用户名和密码不能为空")
         if len(username.encode()) > 255 or len(password.encode()) > 255:
             raise ValueError("SOCKS5 用户名和密码编码后不能超过 255 字节")
         self.port = port
+        self.http_port = http_port
         self.username = username
         self.password = password
         self.check_host = check_host
@@ -122,8 +124,10 @@ class Socks5ProxyPool:
                 }
             return result
 
-    def acquire(self, strategy: str = "round-robin") -> str | None:
+    def acquire(self, strategy: str = "round-robin", protocol: str = "socks5") -> str | None:
         """按策略获取一个代理 URL；返回 None 表示池为空。"""
+        if protocol not in ("socks5", "http"):
+            raise ValueError("protocol 必须是 socks5 或 http")
         with self._lock:
             if not self._nodes:
                 return None
@@ -140,14 +144,24 @@ class Socks5ProxyPool:
             self._connections[instance_id] = self._connections.get(instance_id, 0) + 1
         username = quote(self.username, safe="")
         password = quote(self.password, safe="")
+        if protocol == "http":
+            return f"http://{username}:{password}@{ip}:{self.http_port}"
         return f"socks5://{username}:{password}@{ip}:{self.port}"
 
-    def proxies(self) -> list[str]:
+    def proxies(self, protocol: str = "both") -> list[str]:
+        if protocol not in ("socks5", "http", "both"):
+            raise ValueError("protocol 必须是 socks5、http 或 both")
         username = quote(self.username, safe="")
         password = quote(self.password, safe="")
         with self._lock:
             addresses = sorted(self._nodes.values())
-        return [f"socks5://{username}:{password}@{address}:{self.port}" for address in addresses]
+        result: list[str] = []
+        for address in addresses:
+            if protocol in ("socks5", "both"):
+                result.append(f"socks5://{username}:{password}@{address}:{self.port}")
+            if protocol in ("http", "both"):
+                result.append(f"http://{username}:{password}@{address}:{self.http_port}")
+        return result
 
     def test_proxy(self, public_ip: str, target_host: str, target_port: int = 80, target_path: str = "/", timeout: float | None = None) -> dict[str, object]:
         """通过指定代理节点向目标发起 HTTP GET，返回测试结果。"""
